@@ -24,7 +24,7 @@ export enum BlockCostType {
 export type BlockCost = {
   cost_amount: number;
   cost_type: BlockCostType;
-  cost_filter: { [key: string]: any };
+  cost_filter: Record<string, any>;
 };
 
 /* Mirror of backend/data/block.py:Block */
@@ -37,14 +37,12 @@ export type Block = {
   outputSchema: BlockIORootSchema;
   staticOutput: boolean;
   uiType: BlockUIType;
-  uiKey?: string;
   costs: BlockCost[];
-  hardcodedValues: { [key: string]: any } | null;
 };
 
 export type BlockIORootSchema = {
   type: "object";
-  properties: { [key: string]: BlockIOSubSchema };
+  properties: Record<string, BlockIOSubSchema>;
   required?: (keyof BlockIORootSchema["properties"])[];
   additionalProperties?: { type: string };
 };
@@ -60,6 +58,7 @@ export type BlockIOSimpleTypeSubSchema =
   | BlockIOCredentialsSubSchema
   | BlockIOKVSubSchema
   | BlockIOArraySubSchema
+  | BlockIOTableSubSchema
   | BlockIOStringSubSchema
   | BlockIONumberSubSchema
   | BlockIOBooleanSubSchema
@@ -80,6 +79,7 @@ export enum DataType {
   OBJECT = "object",
   KEY_VALUE = "key-value",
   ARRAY = "array",
+  TABLE = "table",
 }
 
 export type BlockIOSubSchemaMeta = {
@@ -93,9 +93,9 @@ export type BlockIOSubSchemaMeta = {
 
 export type BlockIOObjectSubSchema = BlockIOSubSchemaMeta & {
   type: "object";
-  properties: { [key: string]: BlockIOSubSchema };
-  const?: { [key: keyof BlockIOObjectSubSchema["properties"]]: any };
-  default?: { [key: keyof BlockIOObjectSubSchema["properties"]]: any };
+  properties: Record<string, BlockIOSubSchema>;
+  const?: Record<keyof BlockIOObjectSubSchema["properties"], any>;
+  default?: Record<keyof BlockIOObjectSubSchema["properties"], any>;
   required?: (keyof BlockIOObjectSubSchema["properties"])[];
   secret?: boolean;
 };
@@ -103,8 +103,8 @@ export type BlockIOObjectSubSchema = BlockIOSubSchemaMeta & {
 export type BlockIOKVSubSchema = BlockIOSubSchemaMeta & {
   type: "object";
   additionalProperties?: { type: "string" | "number" | "integer" };
-  const?: { [key: string]: string | number };
-  default?: { [key: string]: string | number };
+  const?: Record<string, string | number>;
+  default?: Record<string, string | number>;
   secret?: boolean;
 };
 
@@ -113,6 +113,20 @@ export type BlockIOArraySubSchema = BlockIOSubSchemaMeta & {
   items?: BlockIOSimpleTypeSubSchema;
   const?: Array<string>;
   default?: Array<string>;
+  secret?: boolean;
+};
+
+// Table cell values are typically primitives
+export type TableCellValue = string | number | boolean | null;
+
+export type TableRow = Record<string, TableCellValue>;
+
+export type BlockIOTableSubSchema = BlockIOSubSchemaMeta & {
+  type: "array";
+  format: "table";
+  items: BlockIOObjectSubSchema;
+  const?: TableRow[];
+  default?: TableRow[];
   secret?: boolean;
 };
 
@@ -140,56 +154,28 @@ export type BlockIOBooleanSubSchema = BlockIOSubSchemaMeta & {
   secret?: boolean;
 };
 
-export type CredentialsType = "api_key" | "oauth2" | "user_password";
+export type CredentialsType =
+  | "api_key"
+  | "oauth2"
+  | "user_password"
+  | "host_scoped";
 
 export type Credentials =
   | APIKeyCredentials
   | OAuth2Credentials
-  | UserPasswordCredentials;
+  | UserPasswordCredentials
+  | HostScopedCredentials;
 
 // --8<-- [start:BlockIOCredentialsSubSchema]
-export const PROVIDER_NAMES = {
-  ANTHROPIC: "anthropic",
-  APOLLO: "apollo",
-  D_ID: "d_id",
-  DISCORD: "discord",
-  E2B: "e2b",
-  EXA: "exa",
-  FAL: "fal",
-  GITHUB: "github",
-  GOOGLE: "google",
-  GOOGLE_MAPS: "google_maps",
-  GROQ: "groq",
-  HUBSPOT: "hubspot",
-  IDEOGRAM: "ideogram",
-  JINA: "jina",
-  LINEAR: "linear",
-  MEDIUM: "medium",
-  MEM0: "mem0",
-  NOTION: "notion",
-  NVIDIA: "nvidia",
-  OLLAMA: "ollama",
-  OPENAI: "openai",
-  OPENWEATHERMAP: "openweathermap",
-  OPEN_ROUTER: "open_router",
-  LLAMA_API: "llama_api",
-  PINECONE: "pinecone",
-  SCREENSHOTONE: "screenshotone",
-  SLANT3D: "slant3d",
-  SMARTLEAD: "smartlead",
-  SMTP: "smtp",
-  TWITTER: "twitter",
-  REPLICATE: "replicate",
-  REDDIT: "reddit",
-  REVID: "revid",
-  UNREAL_SPEECH: "unreal_speech",
-  TODOIST: "todoist",
-  ZEROBOUNCE: "zerobounce",
-} as const;
-// --8<-- [end:BlockIOCredentialsSubSchema]
+// Provider names are now dynamic and fetched from the API
+// This allows for SDK-registered providers without hardcoding
+export type CredentialsProviderName = string;
 
-export type CredentialsProviderName =
-  (typeof PROVIDER_NAMES)[keyof typeof PROVIDER_NAMES];
+// For backward compatibility, we'll keep PROVIDER_NAMES but it should be
+// populated dynamically from the API. This is a placeholder that will be
+// replaced with actual values from the /api/integrations/providers endpoint
+export const PROVIDER_NAMES = {} as Record<string, string>;
+// --8<-- [end:BlockIOCredentialsSubSchema]
 
 export type BlockIOCredentialsSubSchema = BlockIOObjectSubSchema & {
   /* Mirror of backend/data/model.py:CredentialsFieldSchemaExtra */
@@ -197,7 +183,8 @@ export type BlockIOCredentialsSubSchema = BlockIOObjectSubSchema & {
   credentials_scopes?: string[];
   credentials_types: Array<CredentialsType>;
   discriminator?: string;
-  discriminator_mapping?: { [key: string]: CredentialsProviderName };
+  discriminator_mapping?: Record<string, CredentialsProviderName>;
+  discriminator_values?: any[];
   secret?: boolean;
 };
 
@@ -221,6 +208,7 @@ type BlockIOCombinedTypeSubSchema = BlockIOSubSchemaMeta & {
         anyOf: BlockIOSimpleTypeSubSchema[];
         default?: string | number | boolean | null;
         secret?: boolean;
+        format?: string; // For table format and other formats on anyOf schemas
       }
     | BlockIOOneOfSubSchema
     | BlockIODiscriminatedOneOfSubSchema
@@ -242,17 +230,20 @@ export type BlockIODiscriminatedOneOfSubSchema = {
   secret?: boolean;
 };
 
-/* Mirror of backend/data/graph.py:Node */
-export type Node = {
+export type NodeCreatable = {
   id: string;
   block_id: string;
-  input_default: { [key: string]: any };
-  input_nodes: Array<{ name: string; node_id: string }>;
-  output_nodes: Array<{ name: string; node_id: string }>;
+  input_default: Record<string, any>;
   metadata: {
     position: { x: number; y: number };
     [key: string]: any;
   };
+};
+
+/* Mirror of backend/data/graph.py:Node */
+export type Node = NodeCreatable & {
+  input_links: Link[];
+  output_links: Link[];
   webhook?: Webhook;
 };
 
@@ -276,29 +267,47 @@ export type GraphExecutionMeta = {
   user_id: UserID;
   graph_id: GraphID;
   graph_version: number;
-  preset_id?: string;
-  status: "QUEUED" | "RUNNING" | "COMPLETED" | "TERMINATED" | "FAILED";
+  inputs: Record<string, any> | null;
+  credential_inputs: Record<string, CredentialsMetaInput> | null;
+  nodes_input_masks: Record<string, Record<string, any>> | null;
+  preset_id: LibraryAgentPresetID | null;
+  status:
+    | "QUEUED"
+    | "RUNNING"
+    | "COMPLETED"
+    | "TERMINATED"
+    | "FAILED"
+    | "INCOMPLETE";
   started_at: Date;
   ended_at: Date;
-  stats?: {
+  stats: {
+    error: string | null;
     cost: number;
     duration: number;
     duration_cpu_only: number;
     node_exec_time: number;
     node_exec_time_cpu_only: number;
     node_exec_count: number;
-  };
+    activity_status: string | null;
+    [key: string]: any;
+  } | null;
 };
 
 export type GraphExecutionID = Brand<string, "GraphExecutionID">;
 
 /* Mirror of backend/data/execution.py:GraphExecution */
-export type GraphExecution = GraphExecutionMeta & {
+export type GraphExecution = Omit<GraphExecutionMeta, "inputs"> & {
   inputs: Record<string, any>;
   outputs: Record<string, Array<any>>;
   node_executions?: NodeExecutionResult[];
 };
 
+export type GraphExecutionsResponse = {
+  executions: GraphExecutionMeta[];
+  pagination: Pagination;
+};
+
+/* Mirror of backend/data/graph.py:GraphMeta */
 export type GraphMeta = {
   id: GraphID;
   user_id: UserID;
@@ -306,23 +315,30 @@ export type GraphMeta = {
   is_active: boolean;
   name: string;
   description: string;
+  instructions?: string | null;
+  recommended_schedule_cron: string | null;
   forked_from_id?: GraphID | null;
   forked_from_version?: number | null;
   input_schema: GraphIOSchema;
   output_schema: GraphIOSchema;
-  credentials_input_schema: {
-    type: "object";
-    properties: { [key: string]: BlockIOCredentialsSubSchema };
-    required: (keyof GraphMeta["credentials_input_schema"]["properties"])[];
-  };
-};
+  credentials_input_schema: CredentialsInputSchema;
+} & (
+  | {
+      has_external_trigger: true;
+      trigger_setup_info: GraphTriggerInfo;
+    }
+  | {
+      has_external_trigger: false;
+      trigger_setup_info: null;
+    }
+);
 
 export type GraphID = Brand<string, "GraphID">;
 
 /* Derived from backend/data/graph.py:Graph._generate_schema() */
 export type GraphIOSchema = {
   type: "object";
-  properties: { [key: string]: GraphIOSubSchema };
+  properties: Record<string, GraphIOSubSchema>;
   required: (keyof BlockIORootSchema["properties"])[];
 };
 export type GraphIOSubSchema = Omit<
@@ -335,32 +351,54 @@ export type GraphIOSubSchema = Omit<
   metadata?: any;
 };
 
+export type CredentialsInputSchema = {
+  type: "object";
+  properties: Record<string, BlockIOCredentialsSubSchema>;
+  required?: (keyof CredentialsInputSchema["properties"])[];
+};
+
+/* Mirror of backend/data/graph.py:GraphTriggerInfo */
+export type GraphTriggerInfo = {
+  provider: CredentialsProviderName;
+  config_schema: BlockIORootSchema;
+  credentials_input_name: string | null;
+};
+
 /* Mirror of backend/data/graph.py:Graph */
 export type Graph = GraphMeta & {
-  nodes: Array<Node>;
-  links: Array<Link>;
-  has_webhook_trigger: boolean;
+  created_at: Date;
+  nodes: Node[];
+  links: Link[];
+  sub_graphs: Omit<Graph, "sub_graphs">[]; // Flattened sub-graphs
 };
 
 export type GraphUpdateable = Omit<
   Graph,
   | "user_id"
   | "version"
+  | "created_at"
   | "is_active"
+  | "nodes"
   | "links"
+  | "sub_graphs"
   | "input_schema"
   | "output_schema"
   | "credentials_input_schema"
-  | "has_webhook_trigger"
+  | "has_external_trigger"
+  | "trigger_setup_info"
 > & {
   version?: number;
   is_active?: boolean;
-  links: Array<LinkCreatable>;
+  nodes: NodeCreatable[];
+  links: LinkCreatable[];
   input_schema?: GraphIOSchema;
   output_schema?: GraphIOSchema;
 };
 
-export type GraphCreatable = Omit<GraphUpdateable, "id"> & { id?: string };
+export type GraphCreatable = _GraphCreatableInner & {
+  sub_graphs?: _GraphCreatableInner[]; // Flattened sub-graphs
+};
+type _GraphCreatableInner = Omit<GraphUpdateable, "id"> & { id?: string };
 
 /* Mirror of backend/data/execution.py:NodeExecutionResult */
 export type NodeExecutionResult = {
@@ -377,12 +415,21 @@ export type NodeExecutionResult = {
     | "COMPLETED"
     | "TERMINATED"
     | "FAILED";
-  input_data: { [key: string]: any };
-  output_data: { [key: string]: Array<any> };
+  input_data: Record<string, any>;
+  output_data: Record<string, Array<any>>;
   add_time: Date;
   queue_time?: Date;
   start_time?: Date;
   end_time?: Date;
+};
+
+/* Structured validation error types for graph execution */
+export type GraphValidationErrorResponse = {
+  detail: {
+    type: "validation_error";
+    message: string;
+    node_errors: Record<string, Record<string, string>>;
+  };
 };
 
 /* *** LIBRARY *** */
@@ -392,18 +439,32 @@ export type LibraryAgent = {
   id: LibraryAgentID;
   graph_id: GraphID;
   graph_version: number;
-  image_url?: string;
+  image_url: string | null;
   creator_name: string;
   creator_image_url: string;
   status: AgentStatus;
   updated_at: Date;
   name: string;
   description: string;
-  input_schema: BlockIOObjectSubSchema;
+  instructions?: string | null;
+  input_schema: GraphIOSchema;
+  output_schema: GraphIOSchema;
+  credentials_input_schema: CredentialsInputSchema;
   new_output: boolean;
   can_access_graph: boolean;
+  is_favorite: boolean;
   is_latest_version: boolean;
-};
+  recommended_schedule_cron: string | null;
+} & (
+  | {
+      has_external_trigger: true;
+      trigger_setup_info: GraphTriggerInfo;
+    }
+  | {
+      has_external_trigger: false;
+      trigger_setup_info: null;
+    }
+);
 
 export type LibraryAgentID = Brand<string, "LibraryAgentID">;
 
@@ -414,44 +475,57 @@ export enum AgentStatus {
   ERROR = "ERROR",
 }
 
-export interface LibraryAgentResponse {
+export type LibraryAgentResponse = {
   agents: LibraryAgent[];
-  pagination: {
-    current_page: number;
-    page_size: number;
-    total_items: number;
-    total_pages: number;
-  };
-}
+  pagination: Pagination;
+};
 
-export interface LibraryAgentPreset {
-  id: string;
+export type LibraryAgentPreset = {
+  id: LibraryAgentPresetID;
+  created_at: Date;
   updated_at: Date;
   graph_id: GraphID;
   graph_version: number;
+  inputs: Record<string, any>;
+  credentials: Record<string, CredentialsMetaInput>;
   name: string;
   description: string;
   is_active: boolean;
-  inputs: { [key: string]: any };
-}
+} & (
+  | {
+      webhook_id: string;
+      webhook: Webhook;
+    }
+  | {
+      webhook_id?: undefined;
+      webhook?: undefined;
+    }
+);
 
-export interface LibraryAgentPresetResponse {
+export type LibraryAgentPresetID = Brand<string, "LibraryAgentPresetID">;
+
+export type LibraryAgentPresetResponse = {
   presets: LibraryAgentPreset[];
-  pagination: {
-    total: number;
-    page: number;
-    size: number;
-  };
-}
+  pagination: Pagination;
+};
 
-export interface CreateLibraryAgentPresetRequest {
-  name: string;
-  description: string;
-  inputs: { [key: string]: any };
-  graph_id: GraphID;
-  graph_version: number;
-  is_active: boolean;
-}
+export type LibraryAgentPresetCreatable = Omit<
+  LibraryAgentPreset,
+  "id" | "created_at" | "updated_at" | "is_active"
+> & {
+  is_active?: boolean;
+};
+
+export type LibraryAgentPresetCreatableFromGraphExecution = Omit<
+  LibraryAgentPresetCreatable,
+  "graph_id" | "graph_version" | "inputs" | "credentials"
+> & {
+  graph_execution_id: GraphExecutionID;
+};
+
+export type LibraryAgentPresetUpdatable = Partial<
+  Omit<LibraryAgentPresetCreatable, "graph_id" | "graph_version">
+>;
 
 export enum LibraryAgentSortEnum {
   CREATED_AT = "createdAt",
@@ -468,6 +542,7 @@ export type CredentialsMetaResponse = {
   title?: string;
   scopes?: Array<string>;
   username?: string;
+  host?: string;
 };
 
 /* Mirror of backend/server/integrations/router.py:CredentialsDeletionResponse */
@@ -487,7 +562,7 @@ export type CredentialsDeleteNeedConfirmationResponse = {
 export type CredentialsMetaInput = {
   id: string;
   type: CredentialsType;
-  title?: string;
+  title?: string | null;
   provider: string;
 };
 
@@ -526,6 +601,14 @@ export type UserPasswordCredentials = BaseCredentials & {
   password: string;
 };
 
+/* Mirror of backend/backend/data/model.py:HostScopedCredentials */
+export type HostScopedCredentials = BaseCredentials & {
+  type: "host_scoped";
+  title: string;
+  host: string;
+  headers: Record<string, string>;
+};
+
 // Mirror of backend/backend/data/notifications.py:NotificationType
 export type NotificationType =
   | "AGENT_RUN"
@@ -535,7 +618,9 @@ export type NotificationType =
   | "CONTINUOUS_AGENT_ERROR"
   | "DAILY_SUMMARY"
   | "WEEKLY_SUMMARY"
-  | "MONTHLY_SUMMARY";
+  | "MONTHLY_SUMMARY"
+  | "AGENT_APPROVED"
+  | "AGENT_REJECTED";
 
 // Mirror of backend/backend/data/notifications.py:NotificationPreference
 export type NotificationPreferenceDTO = {
@@ -555,9 +640,9 @@ export type Webhook = {
   id: string;
   url: string;
   provider: CredentialsProviderName;
-  credentials_id: string;
+  credentials_id: string; // empty string if not appicable
   webhook_type: string;
-  resource?: string;
+  resource: string; // empty string if not appicable
   events: string[];
   secret: string;
   config: Record<string, any>;
@@ -580,6 +665,7 @@ export enum BlockUIType {
   WEBHOOK_MANUAL = "Webhook (manual)",
   AGENT = "Agent",
   AI = "AI",
+  AYRSHARE = "Ayrshare",
 }
 
 export enum SpecialBlockID {
@@ -596,7 +682,7 @@ export type AnalyticsMetrics = {
 
 export type AnalyticsDetails = {
   type: string;
-  data: { [key: string]: any };
+  data: Record<string, any>;
   index: string;
 };
 
@@ -617,6 +703,7 @@ export type StoreAgent = {
   description: string;
   runs: number;
   rating: number;
+  updated_at: string;
 };
 
 export type StoreAgentsResponse = {
@@ -678,6 +765,7 @@ export type StoreSubmission = {
   name: string;
   sub_heading: string;
   description: string;
+  instructions?: string;
   image_urls: string[];
   date_submitted: string;
   status: SubmissionStatus;
@@ -709,8 +797,10 @@ export type StoreSubmissionRequest = {
   video_url?: string;
   image_urls: string[];
   description: string;
+  instructions?: string | null;
   categories: string[];
   changes_summary?: string;
+  recommended_schedule_cron?: string | null;
 };
 
 export type ProfileDetails = {
@@ -721,6 +811,7 @@ export type ProfileDetails = {
   avatar_url: string;
 };
 
+/* Mirror of backend/executor/scheduler.py:GraphExecutionJobInfo */
 export type Schedule = {
   id: ScheduleID;
   name: string;
@@ -728,17 +819,22 @@ export type Schedule = {
   user_id: UserID;
   graph_id: GraphID;
   graph_version: number;
-  input_data: { [key: string]: any };
+  input_data: Record<string, any>;
+  input_credentials: Record<string, CredentialsMetaInput>;
   next_run_time: Date;
+  timezone: string;
 };
 
 export type ScheduleID = Brand<string, "ScheduleID">;
 
+/* Mirror of backend/server/routers/v1.py:ScheduleCreationRequest */
 export type ScheduleCreatable = {
-  cron: string;
   graph_id: GraphID;
   graph_version: number;
-  input_data: { [key: string]: any };
+  name: string;
+  cron: string;
+  inputs: Record<string, any>;
+  credentials?: Record<string, CredentialsMetaInput>;
 };
 
 export type MyAgent = {
@@ -748,6 +844,7 @@ export type MyAgent = {
   agent_image: string | null;
   last_edited: string;
   description: string;
+  recommended_schedule_cron: string | null;
 };
 
 export type MyAgentsResponse = {
@@ -836,6 +933,7 @@ export interface RefundRequest {
 }
 
 export type OnboardingStep =
+  // Introductory onboarding (Library)
   | "WELCOME"
   | "USAGE_REASON"
   | "INTEGRATIONS"
@@ -843,26 +941,38 @@ export type OnboardingStep =
   | "AGENT_NEW_RUN"
   | "AGENT_INPUT"
   | "CONGRATS"
+  // First Wins
   | "GET_RESULTS"
-  | "RUN_AGENTS"
   | "MARKETPLACE_VISIT"
   | "MARKETPLACE_ADD_AGENT"
   | "MARKETPLACE_RUN_AGENT"
-  | "BUILDER_OPEN"
   | "BUILDER_SAVE_AGENT"
+  // Consistency Challenge
+  | "RE_RUN_AGENT"
+  | "SCHEDULE_AGENT"
+  | "RUN_AGENTS"
+  | "RUN_3_DAYS"
+  // The Pro Playground
+  | "TRIGGER_WEBHOOK"
+  | "RUN_14_DAYS"
+  | "RUN_AGENTS_100"
+  // No longer used but tracked
+  | "BUILDER_OPEN"
   | "BUILDER_RUN_AGENT";
 
 export interface UserOnboarding {
   completedSteps: OnboardingStep[];
-  notificationDot: boolean;
+  walletShown: boolean;
   notified: OnboardingStep[];
   rewardedFor: OnboardingStep[];
   usageReason: string | null;
   integrations: string[];
   otherIntegrations: string | null;
   selectedStoreListingVersionId: string | null;
-  agentInput: { [key: string]: string | number } | null;
+  agentInput: Record<string, string | number> | null;
   onboardingAgentExecutionId: GraphExecutionID | null;
+  lastRunAt: Date | null;
+  consecutiveRunDays: number;
   agentRuns: number;
 }
 
@@ -981,6 +1091,10 @@ function _handleSingleTypeSchema(subSchema: BlockIOSubSchema): DataType {
     return DataType.NUMBER;
   }
   if (subSchema.type === "array") {
+    // Check for table format first
+    if ("format" in subSchema && subSchema.format === "table") {
+      return DataType.TABLE;
+    }
     /** Commented code below since we haven't yet support rendering of a multi-select with array { items: enum } type */
     // if ("items" in subSchema && subSchema.items && "enum" in subSchema.items) {
     //   return DataType.MULTI_SELECT; // array + enum => multi-select
@@ -1060,6 +1174,11 @@ export function determineDataType(schema: BlockIOSubSchema): DataType {
 
     // (array | null)
     if (types.includes("array") && types.includes("null")) {
+      // Check for table format on the parent schema (where anyOf is)
+      if ("format" in schema && schema.format === "table") {
+        return DataType.TABLE;
+      }
+
       const arrSchema = schema.anyOf.find((s) => s.type === "array");
       if (arrSchema) return _handleSingleTypeSchema(arrSchema);
       return DataType.ARRAY;

@@ -10,7 +10,6 @@ from backend.util.settings import Config
 from backend.util.text import TextFormatter
 from backend.util.type import LongTextType, MediaFileType, ShortTextType
 
-formatter = TextFormatter()
 config = Config()
 
 
@@ -95,7 +94,7 @@ class AgentInputBlock(Block):
             }
         )
 
-    def run(self, input_data: Input, *args, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, *args, **kwargs) -> BlockOutput:
         if input_data.value is not None:
             yield "result", input_data.value
 
@@ -131,6 +130,11 @@ class AgentOutputBlock(Block):
             description="The format string to be used to format the recorded_value. Use Jinja2 syntax.",
             default="",
             advanced=True,
+        )
+        escape_html: bool = SchemaField(
+            default=False,
+            advanced=True,
+            description="Whether to escape special characters in the inserted values to be HTML-safe. Enable for HTML output, disable for plain text.",
         )
         advanced: bool = SchemaField(
             description="Whether to treat the output as advanced.",
@@ -186,13 +190,14 @@ class AgentOutputBlock(Block):
             static_output=True,
         )
 
-    def run(self, input_data: Input, *args, **kwargs) -> BlockOutput:
+    async def run(self, input_data: Input, *args, **kwargs) -> BlockOutput:
         """
         Attempts to format the recorded_value using the fmt_string if provided.
         If formatting fails or no fmt_string is given, returns the original recorded_value.
         """
         if input_data.format:
             try:
+                formatter = TextFormatter(autoescape=input_data.escape_html)
                 yield "output", formatter.format_string(
                     input_data.format, {input_data.name: input_data.value}
                 )
@@ -413,6 +418,12 @@ class AgentFileInputBlock(AgentInputBlock):
             advanced=False,
             title="Default Value",
         )
+        base_64: bool = SchemaField(
+            description="Whether produce an output in base64 format (not recommended, you can pass the string path just fine accross blocks).",
+            default=False,
+            advanced=True,
+            title="Produce Base64 Output",
+        )
 
     class Output(AgentInputBlock.Output):
         result: str = SchemaField(description="File reference/path result.")
@@ -436,22 +447,23 @@ class AgentFileInputBlock(AgentInputBlock):
             ],
         )
 
-    def run(
+    async def run(
         self,
         input_data: Input,
         *,
         graph_exec_id: str,
+        user_id: str,
         **kwargs,
     ) -> BlockOutput:
         if not input_data.value:
             return
 
-        file_path = store_media_file(
+        yield "result", await store_media_file(
             graph_exec_id=graph_exec_id,
             file=input_data.value,
-            return_content=False,
+            user_id=user_id,
+            return_content=input_data.base_64,
         )
-        yield "result", file_path
 
 
 class AgentDropdownInputBlock(AgentInputBlock):
@@ -542,6 +554,89 @@ class AgentToggleInputBlock(AgentInputBlock):
         )
 
 
+class AgentTableInputBlock(AgentInputBlock):
+    """
+    This block allows users to input data in a table format.
+
+    Configure the table columns at build time, then users can input
+    rows of data at runtime. Each row is output as a dictionary
+    with column names as keys.
+    """
+
+    class Input(AgentInputBlock.Input):
+        value: Optional[list[dict[str, Any]]] = SchemaField(
+            description="The table data as a list of dictionaries.",
+            default=None,
+            advanced=False,
+            title="Default Value",
+        )
+        column_headers: list[str] = SchemaField(
+            description="Column headers for the table.",
+            default_factory=lambda: ["Column 1", "Column 2", "Column 3"],
+            advanced=False,
+            title="Column Headers",
+        )
+
+        def generate_schema(self):
+            """Generate schema for the value field with table format."""
+            schema = super().generate_schema()
+            schema["type"] = "array"
+            schema["format"] = "table"
+            schema["items"] = {
+                "type": "object",
+                "properties": {
+                    header: {"type": "string"}
+                    for header in (
+                        self.column_headers or ["Column 1", "Column 2", "Column 3"]
+                    )
+                },
+            }
+            if self.value is not None:
+                schema["default"] = self.value
+            return schema
+
+    class Output(AgentInputBlock.Output):
+        result: list[dict[str, Any]] = SchemaField(
+            description="The table data as a list of dictionaries with headers as keys."
+        )
+
+    def __init__(self):
+        super().__init__(
+            id="5603b273-f41e-4020-af7d-fbc9c6a8d928",
+            description="Block for table data input with customizable headers.",
+            disabled=not config.enable_agent_input_subtype_blocks,
+            input_schema=AgentTableInputBlock.Input,
+            output_schema=AgentTableInputBlock.Output,
+            test_input=[
+                {
+                    "name": "test_table",
+                    "column_headers": ["Name", "Age", "City"],
+                    "value": [
+                        {"Name": "John", "Age": "30", "City": "New York"},
+                        {"Name": "Jane", "Age": "25", "City": "London"},
+                    ],
+                    "description": "Example table input",
+                }
+            ],
+            test_output=[
+                (
+                    "result",
+                    [
+                        {"Name": "John", "Age": "30", "City": "New York"},
+                        {"Name": "Jane", "Age": "25", "City": "London"},
+                    ],
+                )
+            ],
+        )
+
+    async def run(self, input_data: Input, *args, **kwargs) -> BlockOutput:
+        """
+        Yields the table data as a list of dictionaries.
+        """
+        # Pass through the value, defaulting to empty list if None
+        yield "result", input_data.value if input_data.value is not None else []
+
+
 IO_BLOCK_IDs = [
     AgentInputBlock().id,
     AgentOutputBlock().id,
@@ -553,4 +648,5 @@ IO_BLOCK_IDs = [
     AgentFileInputBlock().id,
     AgentDropdownInputBlock().id,
     AgentToggleInputBlock().id,
+    AgentTableInputBlock().id,
 ]

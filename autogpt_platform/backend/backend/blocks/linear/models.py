@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from backend.sdk import BaseModel
 
 
 class Comment(BaseModel):
@@ -37,5 +37,5 @@ class Project(BaseModel):
     name: str
     description: str
     priority: int
-    progress: int
-    content: str
+    progress: float
+    content: str | None

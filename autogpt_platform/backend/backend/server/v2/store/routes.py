@@ -3,15 +3,14 @@ import tempfile
 import typing
 import urllib.parse
 
-import autogpt_libs.auth.depends
-import autogpt_libs.auth.middleware
+import autogpt_libs.auth
 import fastapi
 import fastapi.responses
-from autogpt_libs.auth.depends import auth_middleware, get_user_id
 
-import backend.data.block
 import backend.data.graph
+import backend.server.v2.store.cache as store_cache
 import backend.server.v2.store.db
+import backend.server.v2.store.exceptions
 import backend.server.v2.store.image_gen
 import backend.server.v2.store.media
 import backend.server.v2.store.model
@@ -29,16 +28,17 @@ router = fastapi.APIRouter()
 
 @router.get(
     "/profile",
+    summary="Get user profile",
     tags=["store", "private"],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.ProfileDetails,
 )
 async def get_profile(
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Get the profile details for the authenticated user.
+    Cached for 1 hour per user.
     """
     try:
         profile = await backend.server.v2.store.db.get_user_profile(user_id)
@@ -48,25 +48,27 @@ async def get_profile(
                 content={"detail": "Profile not found"},
             )
         return profile
-    except Exception:
-        logger.exception("Exception occurred whilst getting user profile")
+    except Exception as e:
+        logger.exception("Failed to fetch user profile for %s: %s", user_id, e)
         return fastapi.responses.JSONResponse(
             status_code=500,
-            content={"detail": "An error occurred while retrieving the user profile"},
+            content={
+                "detail": "Failed to retrieve user profile",
+                "hint": "Check database connection.",
+            },
         )
 
 
 @router.post(
     "/profile",
+    summary="Update user profile",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.CreatorDetails,
 )
 async def update_or_create_profile(
     profile: backend.server.v2.store.model.Profile,
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Update the store profile for the authenticated user.
@@ -86,11 +88,14 @@ async def update_or_create_profile(
             user_id=user_id, profile=profile
         )
         return updated_profile
-    except Exception:
-        logger.exception("Exception occurred whilst updating profile")
+    except Exception as e:
+        logger.exception("Failed to update profile for user %s: %s", user_id, e)
         return fastapi.responses.JSONResponse(
             status_code=500,
-            content={"detail": "An error occurred while updating the user profile"},
+            content={
+                "detail": "Failed to update user profile",
+                "hint": "Validate request data.",
+            },
         )
 
 
@@ -101,6 +106,7 @@ async def update_or_create_profile(
 
 @router.get(
     "/agents",
+    summary="List store agents",
     tags=["store", "public"],
     response_model=backend.server.v2.store.model.StoreAgentsResponse,
 )
@@ -150,7 +156,7 @@ async def get_agents(
         )
 
     try:
-        agents = await backend.server.v2.store.db.get_store_agents(
+        agents = await store_cache._get_cached_store_agents(
             featured=featured,
             creator=creator,
             sorted_by=sorted_by,
@@ -160,22 +166,26 @@ async def get_agents(
             page_size=page_size,
         )
         return agents
-    except Exception:
-        logger.exception("Exception occured whilst getting store agents")
+    except Exception as e:
+        logger.exception("Failed to retrieve store agents: %s", e)
         return fastapi.responses.JSONResponse(
             status_code=500,
-            content={"detail": "An error occurred while retrieving the store agents"},
+            content={
+                "detail": "Failed to retrieve store agents",
+                "hint": "Check database or search parameters.",
+            },
         )
 
 
 @router.get(
     "/agents/{username}/{agent_name}",
+    summary="Get specific agent",
     tags=["store", "public"],
     response_model=backend.server.v2.store.model.StoreAgentDetails,
 )
 async def get_agent(username: str, agent_name: str):
     """
-    This is only used on the AgentDetails Page
+    This is only used on the AgentDetails Page.
 
     It returns the store listing agents details.
     """
@@ -183,7 +193,7 @@ async def get_agent(username: str, agent_name: str):
         username = urllib.parse.unquote(username).lower()
         # URL decode the agent name since it comes from the URL path
         agent_name = urllib.parse.unquote(agent_name).lower()
-        agent = await backend.server.v2.store.db.get_store_agent_details(
+        agent = await store_cache._get_cached_agent_details(
             username=username, agent_name=agent_name
         )
         return agent
@@ -199,12 +209,11 @@ async def get_agent(username: str, agent_name: str):
 
 @router.get(
     "/graph/{store_listing_version_id}",
+    summary="Get agent graph",
     tags=["store"],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
 )
-async def get_graph_meta_by_store_listing_version_id(
-    store_listing_version_id: str,
-    _: typing.Annotated[str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)],
-):
+async def get_graph_meta_by_store_listing_version_id(store_listing_version_id: str):
     """
     Get Agent Graph from Store Listing Version ID.
     """
@@ -223,13 +232,12 @@ async def get_graph_meta_by_store_listing_version_id(
 
 @router.get(
     "/agents/{store_listing_version_id}",
+    summary="Get agent by version",
     tags=["store"],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.StoreAgentDetails,
 )
-async def get_store_agent(
-    store_listing_version_id: str,
-    _: typing.Annotated[str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)],
-):
+async def get_store_agent(store_listing_version_id: str):
     """
     Get Store Agent Details from Store Listing Version ID.
     """
@@ -237,6 +245,7 @@ async def get_store_agent(
         agent = await backend.server.v2.store.db.get_store_agent_by_version_id(
             store_listing_version_id
         )
+
         return agent
     except Exception:
         logger.exception("Exception occurred whilst getting store agent")
@@ -248,17 +257,16 @@ async def get_store_agent(
 
 @router.post(
     "/agents/{username}/{agent_name}/review",
+    summary="Create agent review",
     tags=["store"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.StoreReview,
 )
 async def create_review(
     username: str,
     agent_name: str,
     review: backend.server.v2.store.model.StoreReviewCreate,
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Create a review for a store agent.
@@ -274,7 +282,7 @@ async def create_review(
     """
     try:
         username = urllib.parse.unquote(username).lower()
-        agent_name = urllib.parse.unquote(agent_name)
+        agent_name = urllib.parse.unquote(agent_name).lower()
         # Create the review
         created_review = await backend.server.v2.store.db.create_store_review(
             user_id=user_id,
@@ -299,6 +307,7 @@ async def create_review(
 
 @router.get(
     "/creators",
+    summary="List store creators",
     tags=["store", "public"],
     response_model=backend.server.v2.store.model.CreatorsResponse,
 )
@@ -332,7 +341,7 @@ async def get_creators(
         )
 
     try:
-        creators = await backend.server.v2.store.db.get_store_creators(
+        creators = await store_cache._get_cached_store_creators(
             featured=featured,
             search_query=search_query,
             sorted_by=sorted_by,
@@ -350,6 +359,7 @@ async def get_creators(
 
 @router.get(
     "/creator/{username}",
+    summary="Get creator details",
     tags=["store", "public"],
     response_model=backend.server.v2.store.model.CreatorDetails,
 )
@@ -357,14 +367,12 @@ async def get_creator(
     username: str,
 ):
     """
-    Get the details of a creator
+    Get the details of a creator.
     - Creator Details Page
     """
     try:
         username = urllib.parse.unquote(username).lower()
-        creator = await backend.server.v2.store.db.get_store_creator_details(
-            username=username.lower()
-        )
+        creator = await store_cache._get_cached_creator_details(username=username)
         return creator
     except Exception:
         logger.exception("Exception occurred whilst getting creator details")
@@ -379,19 +387,27 @@ async def get_creator(
 ############################################
 ############# Store Submissions ###############
 ############################################
+
+
 @router.get(
     "/myagents",
+    summary="Get my agents",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.MyAgentsResponse,
 )
 async def get_my_agents(
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
+    page: typing.Annotated[int, fastapi.Query(ge=1)] = 1,
+    page_size: typing.Annotated[int, fastapi.Query(ge=1)] = 20,
 ):
+    """
+    Get user's own agents.
+    """
     try:
-        agents = await backend.server.v2.store.db.get_my_agents(user_id)
+        agents = await backend.server.v2.store.db.get_my_agents(
+            user_id, page=page, page_size=page_size
+        )
         return agents
     except Exception:
         logger.exception("Exception occurred whilst getting my agents")
@@ -403,15 +419,14 @@ async def get_my_agents(
 
 @router.delete(
     "/submissions/{submission_id}",
+    summary="Delete store submission",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=bool,
 )
 async def delete_submission(
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
     submission_id: str,
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Delete a store listing submission.
@@ -428,6 +443,7 @@ async def delete_submission(
             user_id=user_id,
             submission_id=submission_id,
         )
+
         return result
     except Exception:
         logger.exception("Exception occurred whilst deleting store submission")
@@ -439,14 +455,13 @@ async def delete_submission(
 
 @router.get(
     "/submissions",
+    summary="List my submissions",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.StoreSubmissionsResponse,
 )
 async def get_submissions(
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
     page: int = 1,
     page_size: int = 20,
 ):
@@ -492,15 +507,14 @@ async def get_submissions(
 
 @router.post(
     "/submissions",
+    summary="Create store submission",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
     response_model=backend.server.v2.store.model.StoreSubmission,
 )
 async def create_submission(
     submission_request: backend.server.v2.store.model.StoreSubmissionRequest,
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Create a new store listing submission.
@@ -516,7 +530,7 @@ async def create_submission(
         HTTPException: If there is an error creating the submission
     """
     try:
-        return await backend.server.v2.store.db.create_store_submission(
+        result = await backend.server.v2.store.db.create_store_submission(
             user_id=user_id,
             agent_id=submission_request.agent_id,
             agent_version=submission_request.agent_version,
@@ -525,10 +539,14 @@ async def create_submission(
             video_url=submission_request.video_url,
             image_urls=submission_request.image_urls,
             description=submission_request.description,
+            instructions=submission_request.instructions,
             sub_heading=submission_request.sub_heading,
             categories=submission_request.categories,
             changes_summary=submission_request.changes_summary or "Initial Submission",
+            recommended_schedule_cron=submission_request.recommended_schedule_cron,
         )
+
+        return result
     except Exception:
         logger.exception("Exception occurred whilst creating store submission")
         return fastapi.responses.JSONResponse(
@@ -537,16 +555,58 @@ async def create_submission(
         )
 
 
+@router.put(
+    "/submissions/{store_listing_version_id}",
+    summary="Edit store submission",
+    tags=["store", "private"],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
+    response_model=backend.server.v2.store.model.StoreSubmission,
+)
+async def edit_submission(
+    store_listing_version_id: str,
+    submission_request: backend.server.v2.store.model.StoreSubmissionEditRequest,
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
+):
+    """
+    Edit an existing store listing submission.
+
+    Args:
+        store_listing_version_id (str): ID of the store listing version to edit
+        submission_request (StoreSubmissionRequest): The updated submission details
+        user_id (str): ID of the authenticated user editing the listing
+
+    Returns:
+        StoreSubmission: The updated store submission
+
+    Raises:
+        HTTPException: If there is an error editing the submission
+    """
+    result = await backend.server.v2.store.db.edit_store_submission(
+        user_id=user_id,
+        store_listing_version_id=store_listing_version_id,
+        name=submission_request.name,
+        video_url=submission_request.video_url,
+        image_urls=submission_request.image_urls,
+        description=submission_request.description,
+        instructions=submission_request.instructions,
+        sub_heading=submission_request.sub_heading,
+        categories=submission_request.categories,
+        changes_summary=submission_request.changes_summary,
+        recommended_schedule_cron=submission_request.recommended_schedule_cron,
+    )
+
+    return result
+
+
 @router.post(
     "/submissions/media",
+    summary="Upload submission media",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
 )
 async def upload_submission_media(
     file: fastapi.UploadFile,
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ):
     """
     Upload media (images/videos) for a store listing submission.
@@ -566,6 +626,25 @@ async def upload_submission_media(
             user_id=user_id, file=file
         )
         return media_url
+    except backend.server.v2.store.exceptions.VirusDetectedError as e:
+        logger.warning(f"Virus detected in uploaded file: {e.threat_name}")
+        return fastapi.responses.JSONResponse(
+            status_code=400,
+            content={
+                "detail": f"File rejected due to virus detection: {e.threat_name}",
+                "error_type": "virus_detected",
+                "threat_name": e.threat_name,
+            },
+        )
+    except backend.server.v2.store.exceptions.VirusScanError as e:
+        logger.error(f"Virus scanning failed: {str(e)}")
+        return fastapi.responses.JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Virus scanning service unavailable. Please try again later.",
+                "error_type": "virus_scan_failed",
+            },
+        )
     except Exception:
         logger.exception("Exception occurred whilst uploading submission media")
         return fastapi.responses.JSONResponse(
@@ -576,14 +655,13 @@ async def upload_submission_media(
 
 @router.post(
     "/submissions/generate_image",
+    summary="Generate submission image",
     tags=["store", "private"],
-    dependencies=[fastapi.Depends(autogpt_libs.auth.middleware.auth_middleware)],
+    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
 )
 async def generate_image(
     agent_id: str,
-    user_id: typing.Annotated[
-        str, fastapi.Depends(autogpt_libs.auth.depends.get_user_id)
-    ],
+    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
 ) -> fastapi.responses.Response:
     """
     Generate an image for a store listing submission.
@@ -637,10 +715,10 @@ async def generate_image(
 
 @router.get(
     "/download/agents/{store_listing_version_id}",
+    summary="Download agent file",
     tags=["store", "public"],
 )
 async def download_agent_file(
-    request: fastapi.Request,
     store_listing_version_id: str = fastapi.Path(
         ..., description="The ID of the agent to download"
     ),
@@ -657,15 +735,7 @@ async def download_agent_file(
     Raises:
         HTTPException: If the agent is not found or an unexpected error occurs.
     """
-    try:
-        user_id = get_user_id(await auth_middleware(request))
-    except fastapi.HTTPException:
-        user_id = None
-
-    graph_data = await backend.server.v2.store.db.get_agent(
-        user_id=user_id,
-        store_listing_version_id=store_listing_version_id,
-    )
+    graph_data = await backend.server.v2.store.db.get_agent(store_listing_version_id)
     file_name = f"agent_{graph_data.id}_v{graph_data.version or 'latest'}.json"
 
     # Sending graph as a stream (similar to marketplace v1)
@@ -678,3 +748,58 @@ async def download_agent_file(
         return fastapi.responses.FileResponse(
             tmp_file.name, filename=file_name, media_type="application/json"
         )
+
+
+##############################################
+############### Cache Management #############
+##############################################
+
+
+@router.get(
+    "/metrics/cache",
+    summary="Get cache metrics in Prometheus format",
+    tags=["store", "metrics"],
+    response_class=fastapi.responses.PlainTextResponse,
+)
+async def get_cache_metrics():
+    """
+    Get cache metrics in Prometheus text format.
+
+    Returns Prometheus-compatible metrics for monitoring cache performance.
+    Metrics include size, maxsize, TTL, and hit rate for each cache.
+
+    Returns:
+        str: Prometheus-formatted metrics text
+    """
+    metrics = []
+
+    # Helper to add metrics for a cache
+    def add_cache_metrics(cache_name: str, cache_func):
+        info = cache_func.cache_info()
+        # Cache size metric (dynamic - changes as items are cached/expired)
+        metrics.append(f'store_cache_entries{{cache="{cache_name}"}} {info["size"]}')
+        # Cache utilization percentage (dynamic - useful for monitoring)
+        utilization = (
+            (info["size"] / info["maxsize"] * 100) if info["maxsize"] > 0 else 0
+        )
+        metrics.append(
+            f'store_cache_utilization_percent{{cache="{cache_name}"}} {utilization:.2f}'
+        )
+
+    # Add metrics for each cache
+    add_cache_metrics("store_agents", store_cache._get_cached_store_agents)
+    add_cache_metrics("agent_details", store_cache._get_cached_agent_details)
+    add_cache_metrics("store_creators", store_cache._get_cached_store_creators)
+    add_cache_metrics("creator_details", store_cache._get_cached_creator_details)
+
+    # Add metadata/help text at the beginning
+    prometheus_output = [
+        "# HELP store_cache_entries Number of entries currently in cache",
+        "# TYPE store_cache_entries gauge",
+        "# HELP store_cache_utilization_percent Cache utilization as percentage (0-100)",
+        "# TYPE store_cache_utilization_percent gauge",
+        "",  # Empty line before metrics
+    ]
+    prometheus_output.extend(metrics)
+
+    return "\n".join(prometheus_output)

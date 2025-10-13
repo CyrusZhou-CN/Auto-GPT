@@ -1,6 +1,7 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
+import { isServerSide } from "@/lib/utils/is-server-side";
+import { useEffect, useRef, useState } from "react";
 
 export interface TurnstileProps {
   siteKey: string;
@@ -31,7 +32,7 @@ export function Turnstile({
 
   // Load the Turnstile script
   useEffect(() => {
-    if (typeof window === "undefined" || !shouldRender) return;
+    if (isServerSide() || !shouldRender) return;
 
     // Skip if already loaded
     if (window.turnstile) {
@@ -39,27 +40,57 @@ export function Turnstile({
       return;
     }
 
-    // Create script element
-    const script = document.createElement("script");
-    script.src =
+    const scriptSrc =
       "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+    // If a script already exists, reuse it and attach listeners
+    const existingScript = Array.from(document.scripts).find(
+      (s) => s.src === scriptSrc,
+    );
+
+    if (existingScript) {
+      if (window.turnstile) {
+        setLoaded(true);
+        return;
+      }
+
+      const handleLoad: EventListener = () => {
+        setLoaded(true);
+      };
+      const handleError: EventListener = () => {
+        onError?.(new Error("Failed to load Turnstile script"));
+      };
+
+      existingScript.addEventListener("load", handleLoad);
+      existingScript.addEventListener("error", handleError);
+
+      return () => {
+        existingScript.removeEventListener("load", handleLoad);
+        existingScript.removeEventListener("error", handleError);
+      };
+    }
+
+    // Create a single script element if not present and keep it in the document
+    const script = document.createElement("script");
+    script.src = scriptSrc;
     script.async = true;
     script.defer = true;
 
-    script.onload = () => {
+    const handleLoad: EventListener = () => {
       setLoaded(true);
     };
-
-    script.onerror = () => {
+    const handleError: EventListener = () => {
       onError?.(new Error("Failed to load Turnstile script"));
     };
+
+    script.addEventListener("load", handleLoad);
+    script.addEventListener("error", handleError);
 
     document.head.appendChild(script);
 
     return () => {
-      if (document.head.contains(script)) {
-        document.head.removeChild(script);
-      }
+      script.removeEventListener("load", handleLoad);
+      script.removeEventListener("error", handleError);
     };
   }, [onError, shouldRender]);
 
@@ -120,7 +151,7 @@ export function Turnstile({
   ]);
 
   // Method to reset the widget manually
-  const reset = useCallback(() => {
+  useEffect(() => {
     if (loaded && widgetIdRef.current && window.turnstile && shouldRender) {
       window.turnstile.reset(widgetIdRef.current);
     }

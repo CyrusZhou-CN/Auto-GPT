@@ -1,12 +1,13 @@
 "use client";
-import { Button } from "@/components/ui/button";
+import { Button } from "@/components/atoms/Button/Button";
 import { useRouter } from "next/navigation";
 import { useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { useToast } from "@/components/ui/use-toast";
-import { IconKey, IconUser } from "@/components/ui/icons";
+import { useToast } from "@/components/molecules/Toast/use-toast";
+import { IconKey, IconUser } from "@/components/__legacy__/ui/icons";
 import { Trash2Icon } from "lucide-react";
-import { providerIcons } from "@/components/integrations/credentials-input";
-import { CredentialsProvidersContext } from "@/components/integrations/credentials-provider";
+import { KeyIcon } from "@phosphor-icons/react/dist/ssr";
+import { providerIcons } from "@/app/(platform)/library/agents/[id]/components/AgentRunsView/components/CredentialsInputs/CredentialsInputs";
+import { CredentialsProvidersContext } from "@/providers/agent-credentials/credentials-provider";
 import {
   Table,
   TableBody,
@@ -14,20 +15,11 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table";
+} from "@/components/__legacy__/ui/table";
 import { CredentialsProviderName } from "@/lib/autogpt-server-api";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import useSupabase from "@/lib/supabase/useSupabase";
-import LoadingBox from "@/components/ui/loading";
+import { Dialog } from "@/components/molecules/Dialog/Dialog";
+import { useSupabase } from "@/lib/supabase/hooks/useSupabase";
+import LoadingBox from "@/components/__legacy__/ui/loading";
 
 export default function UserIntegrationsPage() {
   const { supabase, user, isUserLoading } = useSupabase();
@@ -103,6 +95,7 @@ export default function UserIntegrationsPage() {
       "6b9fc200-4726-4973-86c9-cd526f5ce5db", // Replicate
       "53c25cb8-e3ee-465c-a4d1-e75a4c899c2a", // OpenAI
       "24e5d942-d9e3-4798-8151-90143ee55629", // Anthropic
+      "aad82a89-9794-4ebb-977f-d736aa5260a3", // AI/ML
       "4ec22295-8f97-4dd1-b42b-2c6957a02545", // Groq
       "7f7b0654-c36b-4565-8fa7-9a52575dfae2", // D-ID
       "7f26de70-ba0d-494e-ba76-238e65e7b45f", // Jina
@@ -132,21 +125,31 @@ export default function UserIntegrationsPage() {
   }
 
   const allCredentials = providers
-    ? Object.values(providers).flatMap((provider) =>
-        provider.savedCredentials
-          .filter((cred) => !hiddenCredentials.includes(cred.id))
-          .map((credentials) => ({
-            ...credentials,
-            provider: provider.provider,
-            providerName: provider.providerName,
-            ProviderIcon: providerIcons[provider.provider],
-            TypeIcon: {
-              oauth2: IconUser,
-              api_key: IconKey,
-              user_password: IconKey,
-            }[credentials.type],
-          })),
-      )
+    ? Object.values(providers)
+        .filter(
+          (provider): provider is NonNullable<typeof provider> =>
+            provider != null,
+        )
+        .flatMap((provider) =>
+          provider.savedCredentials
+            .filter(
+              (cred) =>
+                !hiddenCredentials.includes(cred.id) &&
+                !cred.id.endsWith("-default"), // Hide SDK-registered default credentials
+            )
+            .map((credentials) => ({
+              ...credentials,
+              provider: provider.provider,
+              providerName: provider.providerName,
+              ProviderIcon: providerIcons[provider.provider] || KeyIcon,
+              TypeIcon: {
+                oauth2: IconUser,
+                api_key: IconKey,
+                user_password: IconKey,
+                host_scoped: IconKey,
+              }[credentials.type],
+            })),
+        )
     : [];
 
   return (
@@ -180,6 +183,7 @@ export default function UserIntegrationsPage() {
                       oauth2: "OAuth2 credentials",
                       api_key: "API key",
                       user_password: "Username & password",
+                      host_scoped: "Host-scoped credentials",
                     }[cred.type]
                   }{" "}
                   - <code>{cred.id}</code>
@@ -198,24 +202,32 @@ export default function UserIntegrationsPage() {
         </TableBody>
       </Table>
 
-      <AlertDialog open={confirmationDialogState.open}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {confirmationDialogState.open && confirmationDialogState.message}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel
+      <Dialog
+        controlled={{
+          isOpen: confirmationDialogState.open,
+          set: (open) => {
+            if (!open) setConfirmationDialogState({ open: false });
+          },
+        }}
+        title="Are you sure?"
+        onClose={() => setConfirmationDialogState({ open: false })}
+        styling={{ maxWidth: "32rem" }}
+      >
+        <Dialog.Content>
+          <p className="text-sm text-zinc-600">
+            {confirmationDialogState.open && confirmationDialogState.message}
+          </p>
+          <Dialog.Footer>
+            <Button
+              variant="secondary"
               onClick={() =>
                 confirmationDialogState.open &&
                 confirmationDialogState.onReject()
               }
             >
               Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
+            </Button>
+            <Button
               variant="destructive"
               onClick={() =>
                 confirmationDialogState.open &&
@@ -223,10 +235,10 @@ export default function UserIntegrationsPage() {
               }
             >
               Continue
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </Button>
+          </Dialog.Footer>
+        </Dialog.Content>
+      </Dialog>
     </div>
   );
 }
