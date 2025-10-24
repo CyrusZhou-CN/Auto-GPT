@@ -4,6 +4,7 @@ import concurrent.futures
 import inspect
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -92,6 +93,7 @@ def expose(func: C) -> C:
 # --------------------------------------------------
 class BaseAppService(AppProcess, ABC):
     shared_event_loop: asyncio.AbstractEventLoop
+    _halt_event: threading.Event
 
     @classmethod
     @abstractmethod
@@ -113,14 +115,38 @@ class BaseAppService(AppProcess, ABC):
         return target_host
 
     def run_service(self) -> None:
-        while True:
-            time.sleep(10)
+        # HACK: run the main event loop outside the main thread to disable Uvicorn's
+        # internal signal handlers, since there is no config option for this :(
+        shared_asyncio_thread = threading.Thread(target=self._run_shared_event_loop)
+        shared_asyncio_thread.start()
+        shared_asyncio_thread.join()
+
+    def _run_shared_event_loop(self) -> None:
+        while not self._halt_event.is_set():
+            self.shared_event_loop.run_until_complete(asyncio.sleep(5))
+
+        logger.info(f"[{self.service_name}] 🛑 Shared event loop stopped")
 
     def run_and_wait(self, coro: Coroutine[Any, Any, T]) -> T:
         return asyncio.run_coroutine_threadsafe(coro, self.shared_event_loop).result()
 
     def run(self):
-        self.shared_event_loop = asyncio.get_event_loop()
+        self.shared_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.shared_event_loop)
+        self._halt_event = threading.Event()
+
+    def cleanup(self):
+        """
+        **💡 Overriding `AppService.lifespan` may be a more convenient option.**
+
+        Implement this method on a subclass to do post-execution cleanup,
+        e.g. disconnecting from a database or terminating child processes.
+
+        **Note:** if you override this method in a subclass, it must call
+        `super().cleanup()` *at the end*!
+        """
+        self._halt_event.set()  # stop main thread
+        super().cleanup()
 
 
 class RemoteCallError(BaseModel):
@@ -183,7 +209,6 @@ class AppService(BaseAppService, ABC):
     fastapi_app: FastAPI
     http_server: uvicorn.Server
     log_level: str = "info"
-    _shutting_down: bool = False
 
     def set_log_level(self, log_level: str):
         """Set the uvicorn log level. Returns self for chaining."""
@@ -259,7 +284,7 @@ class AppService(BaseAppService, ABC):
 
             return sync_endpoint
 
-    @conn_retry("FastAPI server", "Starting FastAPI server")
+    @conn_retry("FastAPI server", "Running FastAPI server")
     def __start_fastapi(self):
         logger.info(
             f"[{self.service_name}] Starting RPC server at http://{api_host}:{self.get_port()}"
@@ -274,32 +299,56 @@ class AppService(BaseAppService, ABC):
                 log_level=self.log_level,
             )
         )
-        self.shared_event_loop.run_until_complete(self.http_server.serve())
+        self.run_and_wait(self.http_server.serve())
+
+        # Perform clean-up when the server exits
+        if not self._cleaned_up:
+            self._cleaned_up = True
+            logger.info(f"[{self.service_name}] 🧹 Running cleanup")
+            self.cleanup()
+            logger.info(f"[{self.service_name}] ✅ Cleanup done")
 
     def _self_terminate(self, signum: int, frame):
-        """Handle SIGTERM with a grace period to allow request handlers to finish"""
-        logger.info(f"[{self.service_name}] 🛑 Starting HTTP server graceful shutdown")
-        if not self.cleaned_up:
-            self.cleaned_up = True
-            self.http_server.handle_exit(
-                signum, frame
-            )  # stop accepting new connections
+        """Pass SIGTERM to Uvicorn so it can shut down gracefully"""
+        signame = signal.Signals(signum).name
+        if not self._shutting_down:
+            self._shutting_down = True
+            logger.info(
+                f"[{self.service_name}] 🛑 Received {signame} ({signum}) - "
+                "Entering RPC server graceful shutdown"
+            )
+            self.http_server.handle_exit(signum, frame)  # stop accepting connections
+
+            # NOTE: Actually stopping the process is triggered by FastAPI's lifespan 👇🏼
         else:
             # Expedite shutdown on second SIGTERM
-            self.llprint(
-                f"[{self.service_name}] Received exit signal {signum}, but cleanup is already underway."
+            logger.info(
+                f"[{self.service_name}] 🛑🛑 Received {signame} ({signum}), "
+                "but shutdown is already underway. Terminating..."
             )
             sys.exit(0)
 
-    def cleanup(self):
-        """Cleanup with double-call protection."""
-        if hasattr(self, "_cleanup_called"):
-            logger.debug(f"[{self.service_name}] Cleanup already called, skipping")
-            return
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        """
+        The FastAPI/Uvicorn server's lifespan manager, used for setup and shutdown.
 
-        self._cleanup_called = True
-        logger.info(f"[{self.service_name}] 🧹 Running cleanup")
-        super().cleanup()
+        You can extend and use this in a subclass like:
+        ```
+        @asynccontextmanager
+        async def lifespan(self, app: FastAPI):
+            async with super().lifespan(app):
+                await db.connect()
+                yield
+                await db.disconnect()
+        ```
+        """
+        # Startup - this runs before Uvicorn starts accepting connections
+
+        yield
+
+        # Shutdown - this runs when FastAPI/Uvicorn shuts down
+        logger.info(f"[{self.service_name}] ✅ FastAPI has finished")
 
     async def health_check(self) -> str:
         """A method to check the health of the process."""
@@ -309,18 +358,7 @@ class AppService(BaseAppService, ABC):
         sentry_init()
         super().run()
 
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            # Startup
-
-            yield
-
-            # Shutdown - this runs when FastAPI is shutting down
-            logger.info("🛑 FastAPI has finished; service can shut down")
-            self.cleanup()
-            sys.exit(0)
-
-        self.fastapi_app = FastAPI(lifespan=lifespan)
+        self.fastapi_app = FastAPI(lifespan=self.lifespan)
 
         # Add Prometheus instrumentation to all services
         try:
