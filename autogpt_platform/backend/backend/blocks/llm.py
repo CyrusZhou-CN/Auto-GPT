@@ -797,7 +797,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
             default="",
             description="The system prompt to provide additional context to the model.",
         )
-        conversation_history: list[dict] = SchemaField(
+        conversation_history: list[dict] | None = SchemaField(
             default_factory=list,
             description="The conversation history to provide context for the prompt.",
         )
@@ -904,7 +904,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         logger.debug(f"Calling LLM with input data: {input_data}")
-        prompt = [json.to_dict(p) for p in input_data.conversation_history]
+        prompt = [json.to_dict(p) for p in input_data.conversation_history or [] if p]
 
         values = input_data.prompt_values
         if values:
