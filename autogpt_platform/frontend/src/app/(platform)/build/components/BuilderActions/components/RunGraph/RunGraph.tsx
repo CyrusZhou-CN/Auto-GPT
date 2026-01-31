@@ -1,50 +1,76 @@
-import { Button } from "@/components/atoms/Button/Button";
-import { PlayIcon } from "lucide-react";
-import { useRunGraph } from "./useRunGraph";
 import { useGraphStore } from "@/app/(platform)/build/stores/graphStore";
-import { useShallow } from "zustand/react/shallow";
-import { StopIcon } from "@phosphor-icons/react";
-import { cn } from "@/lib/utils";
-import { RunInputDialog } from "../RunInputDialog/RunInputDialog";
+import { Button } from "@/components/atoms/Button/Button";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/atoms/Tooltip/BaseTooltip";
+import { CircleNotchIcon, PlayIcon, StopIcon } from "@phosphor-icons/react";
+import { useShallow } from "zustand/react/shallow";
+import { RunInputDialog } from "../RunInputDialog/RunInputDialog";
+import { useRunGraph } from "./useRunGraph";
+import { cn } from "@/lib/utils";
 
-export const RunGraph = () => {
+export const RunGraph = ({ flowID }: { flowID: string | null }) => {
   const {
     handleRunGraph,
     handleStopGraph,
-    isSaving,
     openRunInputDialog,
     setOpenRunInputDialog,
+    isExecutingGraph,
+    isTerminatingGraph,
+    isSaving,
   } = useRunGraph();
   const isGraphRunning = useGraphStore(
     useShallow((state) => state.isGraphRunning),
   );
+
+  const isLoading = isExecutingGraph || isTerminatingGraph || isSaving;
+
+  // Determine which icon to show with proper animation
+  const renderIcon = () => {
+    const iconClass = cn(
+      "size-4 transition-transform duration-200 ease-out",
+      !isLoading && "group-hover:scale-110",
+    );
+
+    if (isLoading) {
+      return (
+        <CircleNotchIcon
+          className={cn(iconClass, "animate-spin")}
+          weight="bold"
+        />
+      );
+    }
+
+    if (isGraphRunning) {
+      return <StopIcon className={iconClass} weight="fill" />;
+    }
+
+    return <PlayIcon className={iconClass} weight="fill" />;
+  };
 
   return (
     <>
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
-            variant="primary"
-            size="large"
-            className={cn(
-              "relative min-w-0 border-none bg-gradient-to-r from-purple-500 to-pink-500 text-lg",
-            )}
+            size="icon"
+            variant={isGraphRunning ? "destructive" : "primary"}
+            data-id={isGraphRunning ? "stop-graph-button" : "run-graph-button"}
             onClick={isGraphRunning ? handleStopGraph : handleRunGraph}
+            disabled={!flowID || isLoading}
+            className="group"
           >
-            {!isGraphRunning && !isSaving ? (
-              <PlayIcon className="size-6" />
-            ) : (
-              <StopIcon className="size-6" />
-            )}
+            {renderIcon()}
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          {isGraphRunning ? "Stop agent" : "Run agent"}
+          {isLoading
+            ? "Processing..."
+            : isGraphRunning
+              ? "Stop agent"
+              : "Run agent"}
         </TooltipContent>
       </Tooltip>
       <RunInputDialog

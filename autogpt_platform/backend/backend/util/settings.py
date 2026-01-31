@@ -185,6 +185,12 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         description="Number of top blocks with most errors to show when no blocks exceed threshold (0 to disable).",
     )
 
+    # Execution Accuracy Monitoring
+    execution_accuracy_check_interval_hours: int = Field(
+        default=24,
+        description="Interval in hours between execution accuracy alert checks.",
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="allow",
@@ -258,7 +264,7 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
     )
 
     reddit_user_agent: str = Field(
-        default="AutoGPT:1.0 (by /u/autogpt)",
+        default="web:AutoGPT:v0.6.0 (by /u/autogpt)",
         description="The user agent for the Reddit API",
     )
 
@@ -344,6 +350,19 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         description="Whether to mark failed scans as clean or not",
     )
 
+    agentgenerator_host: str = Field(
+        default="",
+        description="The host for the Agent Generator service (empty to use built-in)",
+    )
+    agentgenerator_port: int = Field(
+        default=8000,
+        description="The port for the Agent Generator service",
+    )
+    agentgenerator_timeout: int = Field(
+        default=600,
+        description="The timeout in seconds for Agent Generator service requests (includes retries for rate limits)",
+    )
+
     enable_example_blocks: bool = Field(
         default=False,
         description="Whether to enable example blocks in production",
@@ -354,6 +373,13 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         ge=1,
         le=24,
         description="Hours between cloud storage cleanup runs (1-24 hours)",
+    )
+
+    oauth_token_cleanup_interval_hours: int = Field(
+        default=6,
+        ge=1,
+        le=24,
+        description="Hours between OAuth token cleanup runs (1-24 hours)",
     )
 
     upload_file_size_limit_mb: int = Field(
@@ -437,6 +463,12 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         default=["http://localhost:3000"],
         description="Allowed Origins for CORS. Supports exact URLs (http/https) or entries prefixed with "
         '"regex:" to match via regular expression.',
+    )
+
+    external_oauth_callback_origins: List[str] = Field(
+        default=["http://localhost:3000"],
+        description="Allowed callback URL origins for external OAuth flows. "
+        "External apps (like Autopilot) must have their callback URLs start with one of these origins.",
     )
 
     @field_validator("backend_cors_allow_origins")
@@ -571,6 +603,12 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
     open_router_api_key: str = Field(default="", description="Open Router API Key")
     llama_api_key: str = Field(default="", description="Llama API Key")
     v0_api_key: str = Field(default="", description="v0 by Vercel API key")
+    webshare_proxy_username: str = Field(
+        default="", description="Webshare Proxy Username"
+    )
+    webshare_proxy_password: str = Field(
+        default="", description="Webshare Proxy Password"
+    )
 
     reddit_client_id: str = Field(default="", description="Reddit client ID")
     reddit_client_secret: str = Field(default="", description="Reddit client secret")
@@ -633,6 +671,20 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
 
     ayrshare_api_key: str = Field(default="", description="Ayrshare API Key")
     ayrshare_jwt_key: str = Field(default="", description="Ayrshare private Key")
+
+    # Langfuse prompt management
+    langfuse_public_key: str = Field(default="", description="Langfuse public key")
+    langfuse_secret_key: str = Field(default="", description="Langfuse secret key")
+    langfuse_host: str = Field(
+        default="https://cloud.langfuse.com", description="Langfuse host URL"
+    )
+
+    # PostHog analytics
+    posthog_api_key: str = Field(default="", description="PostHog API key")
+    posthog_host: str = Field(
+        default="https://eu.i.posthog.com", description="PostHog host URL"
+    )
+
     # Add more secret fields as needed
     model_config = SettingsConfigDict(
         env_file=".env",

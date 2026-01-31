@@ -7,6 +7,8 @@ import { PlusIcon } from "@phosphor-icons/react";
 import { BlockInfo } from "@/app/api/__generated__/models/blockInfo";
 import { useControlPanelStore } from "../../../stores/controlPanelStore";
 import { blockDragPreviewStyle } from "./style";
+import { useReactFlow } from "@xyflow/react";
+import { useNodeStore } from "../../../stores/nodeStore";
 interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   title?: string;
   description?: string;
@@ -29,6 +31,23 @@ export const Block: BlockComponent = ({
   const setBlockMenuOpen = useControlPanelStore(
     (state) => state.setBlockMenuOpen,
   );
+  const { setViewport } = useReactFlow();
+  const { addBlock } = useNodeStore();
+
+  const handleClick = () => {
+    const customNode = addBlock(blockData);
+    setTimeout(() => {
+      setViewport(
+        {
+          x: -customNode.position.x * 0.8 + window.innerWidth / 2,
+          y: -customNode.position.y * 0.8 + (window.innerHeight - 400) / 2,
+          zoom: 0.8,
+        },
+        { duration: 500 },
+      );
+    }, 50);
+  };
+
   const handleDragStart = (e: React.DragEvent<HTMLButtonElement>) => {
     e.dataTransfer.effectAllowed = "copy";
     e.dataTransfer.setData("application/reactflow", JSON.stringify(blockData));
@@ -46,15 +65,22 @@ export const Block: BlockComponent = ({
     setTimeout(() => document.body.removeChild(dragPreview), 0);
   };
 
+  // Generate a data-id from the block id (e.g., "AgentInputBlock" -> "block-card-AgentInputBlock")
+  const blockDataId = blockData.id
+    ? `block-card-${blockData.id.replace(/[^a-zA-Z0-9]/g, "")}`
+    : undefined;
+
   return (
     <Button
       draggable={true}
+      data-id={blockDataId}
       className={cn(
         "group flex h-16 w-full min-w-[7.5rem] items-center justify-start space-x-3 whitespace-normal rounded-[0.75rem] bg-zinc-50 px-[0.875rem] py-[0.625rem] text-start shadow-none",
         "hover:cursor-default hover:bg-zinc-100 focus:ring-0 active:bg-zinc-100 active:ring-1 active:ring-zinc-300 disabled:cursor-not-allowed",
         className,
       )}
       onDragStart={handleDragStart}
+      onClick={handleClick}
       {...rest}
     >
       <div className="flex flex-1 flex-col items-start gap-0.5">

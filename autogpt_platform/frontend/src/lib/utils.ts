@@ -2,12 +2,15 @@ import { type ClassValue, clsx } from "clsx";
 import { isEmpty as _isEmpty } from "lodash";
 import { twMerge } from "tailwind-merge";
 
+import { NodeDimension } from "@/app/(platform)/build/components/legacy-builder/Flow/Flow";
 import {
   BlockIOObjectSubSchema,
   BlockIORootSchema,
+  BlockIOSubSchema,
   Category,
+  GraphInputSubSchema,
+  GraphOutputSubSchema,
 } from "@/lib/autogpt-server-api/types";
-import { NodeDimension } from "@/app/(platform)/build/components/legacy-builder/Flow/Flow";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -76,8 +79,8 @@ export function getTypeBgColor(type: string | null): string {
   );
 }
 
-export function getTypeColor(type: string | null): string {
-  if (type === null) return "#6b7280";
+export function getTypeColor(type: string | undefined): string {
+  if (!type) return "#6b7280";
   return (
     {
       string: "#22c55e",
@@ -88,9 +91,57 @@ export function getTypeColor(type: string | null): string {
       array: "#6366f1",
       null: "#6b7280",
       any: "#6b7280",
-      "": "#6b7280",
     }[type] || "#6b7280"
   );
+}
+
+/**
+ * Extracts the effective type from a JSON schema, handling anyOf/oneOf/allOf wrappers.
+ * Returns the first non-null type found in the schema structure.
+ */
+export function getEffectiveType(
+  schema:
+    | BlockIOSubSchema
+    | GraphInputSubSchema
+    | GraphOutputSubSchema
+    | null
+    | undefined,
+): string | undefined {
+  if (!schema) return undefined;
+
+  // Direct type property
+  if ("type" in schema && schema.type) {
+    return String(schema.type);
+  }
+
+  // Handle allOf - typically a single-item wrapper
+  if (
+    "allOf" in schema &&
+    Array.isArray(schema.allOf) &&
+    schema.allOf.length > 0
+  ) {
+    return getEffectiveType(schema.allOf[0]);
+  }
+
+  // Handle anyOf - e.g. [{ type: "string" }, { type: "null" }]
+  if ("anyOf" in schema && Array.isArray(schema.anyOf)) {
+    for (const item of schema.anyOf) {
+      if ("type" in item && item.type !== "null") {
+        return String(item.type);
+      }
+    }
+  }
+
+  // Handle oneOf
+  if ("oneOf" in schema && Array.isArray(schema.oneOf)) {
+    for (const item of schema.oneOf) {
+      if ("type" in item && item.type !== "null") {
+        return String(item.type);
+      }
+    }
+  }
+
+  return undefined;
 }
 
 export function beautifyString(name: string): string {
@@ -153,24 +204,29 @@ export function setNestedProperty(obj: any, path: string, value: any) {
     throw new Error("Path must be a non-empty string");
   }
 
-  const keys = path.split(/[\/.]/);
+  // Split by both / and . to handle mixed separators, then filter empty strings
+  const keys = path.split(/[\/.]/).filter((key) => key.length > 0);
 
+  if (keys.length === 0) {
+    throw new Error("Path must be a non-empty string");
+  }
+
+  // Validate keys for prototype pollution protection
   for (const key of keys) {
-    if (
-      !key ||
-      key === "__proto__" ||
-      key === "constructor" ||
-      key === "prototype"
-    ) {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
       throw new Error(`Invalid property name: ${key}`);
     }
   }
 
+  // Securely traverse and set nested properties
+  // Use Object.prototype.hasOwnProperty.call() to safely check properties
   let current = obj;
 
   for (let i = 0; i < keys.length - 1; i++) {
     const key = keys[i];
-    if (!current.hasOwnProperty(key)) {
+
+    // Use hasOwnProperty check to avoid prototype chain access
+    if (!Object.prototype.hasOwnProperty.call(current, key)) {
       current[key] = {};
     } else if (typeof current[key] !== "object" || current[key] === null) {
       current[key] = {};
@@ -178,7 +234,10 @@ export function setNestedProperty(obj: any, path: string, value: any) {
     current = current[key];
   }
 
-  current[keys[keys.length - 1]] = value;
+  // Set the final value using bracket notation with validated key
+  // Since we've validated all keys, this is safe from prototype pollution
+  const finalKey = keys[keys.length - 1];
+  current[finalKey] = value;
 }
 
 export function pruneEmptyValues(
@@ -419,4 +478,27 @@ export function isEmpty(value: any): boolean {
 /** Check if a value is an object or not */
 export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Validate YouTube URL */
+export function validateYouTubeUrl(val: string): boolean {
+  if (!val) return true;
+  try {
+    const url = new URL(val);
+    const allowedHosts = [
+      "youtube.com",
+      "www.youtube.com",
+      "youtu.be",
+      "www.youtu.be",
+    ];
+    return allowedHosts.includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isValidUUID(value: string): boolean {
+  const uuidRegex =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(value);
 }

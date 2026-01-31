@@ -1,16 +1,16 @@
 import { Button } from "@/components/atoms/Button/Button";
-import { ClockIcon } from "@phosphor-icons/react";
-import { RunInputDialog } from "../RunInputDialog/RunInputDialog";
-import { useScheduleGraph } from "./useScheduleGraph";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/atoms/Tooltip/BaseTooltip";
+import { ClockIcon } from "@phosphor-icons/react";
 import { CronSchedulerDialog } from "../CronSchedulerDialog/CronSchedulerDialog";
+import { RunInputDialog } from "../RunInputDialog/RunInputDialog";
+import { useScheduleGraph } from "./useScheduleGraph";
 
-export const ScheduleGraph = () => {
+export const ScheduleGraph = ({ flowID }: { flowID: string | null }) => {
   const {
     openScheduleInputDialog,
     setOpenScheduleInputDialog,
@@ -24,12 +24,13 @@ export const ScheduleGraph = () => {
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              variant="primary"
-              size="large"
-              className={"relative min-w-0 border-none text-lg"}
+              variant="outline"
+              size="icon"
+              data-id="schedule-graph-button"
               onClick={handleScheduleGraph}
+              disabled={!flowID}
             >
-              <ClockIcon className="size-6" />
+              <ClockIcon className="size-4" />
             </Button>
           </TooltipTrigger>
           <TooltipContent>

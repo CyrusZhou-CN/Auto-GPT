@@ -80,6 +80,7 @@ export enum DataType {
   KEY_VALUE = "key-value",
   ARRAY = "array",
   TABLE = "table",
+  GOOGLE_DRIVE_PICKER = "google-drive-picker",
 }
 
 export type BlockIOSubSchemaMeta = {
@@ -114,6 +115,53 @@ export type BlockIOArraySubSchema = BlockIOSubSchemaMeta & {
   const?: Array<string>;
   default?: Array<string>;
   secret?: boolean;
+};
+
+export type GoogleDriveFile = {
+  id: string;
+  name?: string;
+  mimeType?: string;
+  url?: string;
+  iconUrl?: string;
+  isFolder?: boolean;
+};
+
+/** Valid view types for Google Drive Picker - matches backend AttachmentView */
+export type AttachmentView =
+  | "DOCS"
+  | "DOCUMENTS"
+  | "SPREADSHEETS"
+  | "PRESENTATIONS"
+  | "DOCS_IMAGES"
+  | "FOLDERS";
+
+export type GoogleDrivePickerConfig = {
+  multiselect?: boolean;
+  allow_folder_selection?: boolean;
+  allowed_views?: AttachmentView[];
+  allowed_mime_types?: string[];
+  scopes?: string[];
+  /**
+   * Auto-credentials configuration for combined picker + credentials fields.
+   * When present, the picker will include _credentials_id in the output.
+   */
+  auto_credentials?: {
+    provider: string;
+    type: string;
+    scopes?: string[];
+    kwarg_name: string;
+  };
+};
+
+/**
+ * Schema for Google Drive Picker input fields.
+ * When multiselect=false: type="object" (single GoogleDriveFile)
+ * When multiselect=true: type="array" with items={ type="object" } (array of GoogleDriveFile)
+ */
+export type GoogleDrivePickerSchema = BlockIOSubSchemaMeta & {
+  type: "object" | "array";
+  format: "google-drive-picker";
+  google_drive_picker_config?: GoogleDrivePickerConfig;
 };
 
 // Table cell values are typically primitives
@@ -197,8 +245,8 @@ export type BlockIONullSubSchema = BlockIOSubSchemaMeta & {
 // At the time of writing, combined schemas only occur on the first nested level in a
 // block schema. It is typed this way to make the use of these objects less tedious.
 type BlockIOCombinedTypeSubSchema = BlockIOSubSchemaMeta & {
-  type: never;
-  const: never;
+  type?: never;
+  const?: never;
 } & (
     | {
         allOf: [BlockIOSimpleTypeSubSchema];
@@ -277,9 +325,10 @@ export type GraphExecutionMeta = {
     | "COMPLETED"
     | "TERMINATED"
     | "FAILED"
-    | "INCOMPLETE";
-  started_at: Date;
-  ended_at: Date;
+    | "INCOMPLETE"
+    | "REVIEW";
+  started_at: Date | null;
+  ended_at: Date | null;
   stats: {
     error: string | null;
     cost: number;
@@ -319,8 +368,8 @@ export type GraphMeta = {
   recommended_schedule_cron: string | null;
   forked_from_id?: GraphID | null;
   forked_from_version?: number | null;
-  input_schema: GraphIOSchema;
-  output_schema: GraphIOSchema;
+  input_schema: GraphInputSchema;
+  output_schema: GraphOutputSchema;
   credentials_input_schema: CredentialsInputSchema;
 } & (
   | {
@@ -336,19 +385,51 @@ export type GraphMeta = {
 export type GraphID = Brand<string, "GraphID">;
 
 /* Derived from backend/data/graph.py:Graph._generate_schema() */
-export type GraphIOSchema = {
+export type GraphInputSchema = {
   type: "object";
-  properties: Record<string, GraphIOSubSchema>;
-  required: (keyof BlockIORootSchema["properties"])[];
+  properties: Record<string, GraphInputSubSchema>;
+  required: (keyof GraphInputSchema["properties"])[];
 };
-export type GraphIOSubSchema = Omit<
-  BlockIOSubSchemaMeta,
-  "placeholder" | "depends_on" | "hidden"
-> & {
-  type: never; // bodge to avoid type checking hell; doesn't exist at runtime
-  default?: string;
+export type GraphInputSubSchema = GraphOutputSubSchema &
+  (
+    | { type?: never; default: any | null } // AgentInputBlock (generic Any type)
+    | { type: "string"; format: "short-text"; default: string | null } // AgentShortTextInputBlock
+    | { type: "string"; format: "long-text"; default: string | null } // AgentLongTextInputBlock
+    | { type: "integer"; default: number | null } // AgentNumberInputBlock
+    | { type: "string"; format: "date"; default: string | null } // AgentDateInputBlock
+    | { type: "string"; format: "time"; default: string | null } // AgentTimeInputBlock
+    | { type: "string"; format: "file"; default: string | null } // AgentFileInputBlock
+    | { type: "string"; enum: string[]; default: string | null } // AgentDropdownInputBlock
+    | { type: "boolean"; default: boolean } // AgentToggleInputBlock
+    | {
+        // AgentTableInputBlock
+        type: "array";
+        format: "table";
+        items: {
+          type: "object";
+          properties: Record<string, { type: "string" }>;
+        };
+        default: Array<Record<string, string>> | null;
+      }
+    | {
+        // AgentGoogleDriveFileInputBlock
+        type: "object";
+        format: "google-drive-picker";
+        google_drive_picker_config?: GoogleDrivePickerConfig;
+        default: GoogleDriveFile | null;
+      }
+  );
+export type GraphOutputSchema = {
+  type: "object";
+  properties: Record<string, GraphOutputSubSchema>;
+  required: (keyof GraphOutputSchema["properties"])[];
+};
+export type GraphOutputSubSchema = {
+  // TODO: typed outputs based on the incoming edges?
+  title: string;
+  description?: string;
+  advanced: boolean;
   secret: boolean;
-  metadata?: any;
 };
 
 export type CredentialsInputSchema = {
@@ -391,8 +472,8 @@ export type GraphUpdateable = Omit<
   is_active?: boolean;
   nodes: NodeCreatable[];
   links: LinkCreatable[];
-  input_schema?: GraphIOSchema;
-  output_schema?: GraphIOSchema;
+  input_schema?: GraphInputSchema;
+  output_schema?: GraphOutputSchema;
 };
 
 export type GraphCreatable = _GraphCreatableInner & {
@@ -414,7 +495,8 @@ export type NodeExecutionResult = {
     | "RUNNING"
     | "COMPLETED"
     | "TERMINATED"
-    | "FAILED";
+    | "FAILED"
+    | "REVIEW";
   input_data: Record<string, any>;
   output_data: Record<string, Array<any>>;
   add_time: Date;
@@ -447,8 +529,8 @@ export type LibraryAgent = {
   name: string;
   description: string;
   instructions?: string | null;
-  input_schema: GraphIOSchema;
-  output_schema: GraphIOSchema;
+  input_schema: GraphInputSchema;
+  output_schema: GraphOutputSchema;
   credentials_input_schema: CredentialsInputSchema;
   new_output: boolean;
   can_access_graph: boolean;
@@ -543,6 +625,7 @@ export type CredentialsMetaResponse = {
   scopes?: Array<string>;
   username?: string;
   host?: string;
+  is_system?: boolean;
 };
 
 /* Mirror of backend/server/integrations/router.py:CredentialsDeletionResponse */
@@ -711,28 +794,6 @@ export type StoreAgentsResponse = {
   pagination: Pagination;
 };
 
-export type StoreAgentDetails = {
-  store_listing_version_id: string;
-  slug: string;
-  updated_at: string;
-  agent_name: string;
-  agent_video: string;
-  agent_image: string[];
-  creator: string;
-  creator_avatar: string;
-  sub_heading: string;
-  description: string;
-  categories: string[];
-  runs: number;
-  rating: number;
-  versions: string[];
-
-  // Approval and status fields
-  active_version_id?: string;
-  has_approved_version?: boolean;
-  is_available?: boolean;
-};
-
 export type Creator = {
   name: string;
   username: string;
@@ -884,7 +945,7 @@ export interface APIKey {
   prefix: string;
   postfix: string;
   status: APIKeyStatus;
-  permissions: APIKeyPermission[];
+  scopes: APIKeyPermission[];
   created_at: string;
   last_used_at?: string;
   revoked_at?: string;
@@ -942,6 +1003,7 @@ export type OnboardingStep =
   | "AGENT_INPUT"
   | "CONGRATS"
   // First Wins
+  | "VISIT_COPILOT"
   | "GET_RESULTS"
   | "MARKETPLACE_VISIT"
   | "MARKETPLACE_ADD_AGENT"
@@ -978,8 +1040,8 @@ export interface UserOnboarding {
 
 export interface OnboardingNotificationPayload {
   type: "onboarding";
-  event: string;
-  step: OnboardingStep;
+  event: "step_completed" | "increment_runs";
+  step: OnboardingStep | null;
 }
 
 export type WebSocketNotification =
@@ -1149,6 +1211,13 @@ export function determineDataType(schema: BlockIOSubSchema): DataType {
   // Credentials override
   if ("credentials_provider" in schema) {
     return DataType.CREDENTIALS;
+  }
+
+  if (
+    "google_drive_picker_config" in schema ||
+    ("format" in schema && schema.format === "google-drive-picker")
+  ) {
+    return DataType.GOOGLE_DRIVE_PICKER;
   }
 
   // enum == SELECT
