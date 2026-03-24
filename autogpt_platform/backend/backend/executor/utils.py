@@ -46,7 +46,7 @@ from backend.util.exceptions import (
 )
 from backend.util.logging import TruncatedLogger, is_structured_logging_enabled
 from backend.util.settings import Config
-from backend.util.type import convert
+from backend.util.type import coerce_inputs_to_schema
 
 config = Config()
 logger = TruncatedLogger(logging.getLogger(__name__), prefix="[GraphExecutorUtil]")
@@ -213,11 +213,8 @@ def validate_exec(
     if resolve_input:
         data = merge_execution_input(data)
 
-    # Convert non-matching data types to the expected input schema.
-    for name, data_type in schema.__annotations__.items():
-        value = data.get(name)
-        if (value is not None) and (type(value) is not data_type):
-            data[name] = convert(value, data_type)
+    # Coerce non-matching data types to the expected input schema.
+    coerce_inputs_to_schema(data, schema)
 
     # Input data post-merge should contain all required fields from the schema.
     if missing_input := schema.get_missing_input(data):
@@ -480,6 +477,22 @@ async def _construct_starting_node_execution_input(
         # Apply node input overrides
         if nodes_input_masks and (node_input_mask := nodes_input_masks.get(node.id)):
             input_data.update(node_input_mask)
+
+        # Webhook-triggered agents cannot be executed directly without payload data.
+        # Legitimate webhook triggers provide payload via nodes_input_masks above.
+        if (
+            block.block_type
+            in (
+                BlockType.WEBHOOK,
+                BlockType.WEBHOOK_MANUAL,
+            )
+            and "payload" not in input_data
+        ):
+            raise ValueError(
+                "This agent is triggered by an external event (webhook) "
+                "and cannot be executed directly. "
+                "Please use the appropriate trigger to run this agent."
+            )
 
         input_data, error = validate_exec(node, input_data)
         if input_data is None:
