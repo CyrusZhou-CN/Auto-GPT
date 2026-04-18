@@ -10,6 +10,7 @@ import {
 } from "@/components/molecules/Toast/use-toast";
 
 import { RefundModal } from "./RefundModal";
+import { SubscriptionTierSection } from "./components/SubscriptionTierSection/SubscriptionTierSection";
 import { CreditTransaction } from "@/lib/autogpt-server-api";
 import { UsagePanelContent } from "@/app/(platform)/copilot/components/UsageLimits/UsageLimits";
 import type { CoPilotUsageStatus } from "@/app/api/__generated__/models/coPilotUsageStatus";
@@ -34,7 +35,7 @@ function CoPilotUsageSection() {
     },
   });
 
-  if (isLoading || !usage) return null;
+  if (isLoading || !usage?.daily || !usage?.weekly) return null;
   if (usage.daily.limit <= 0 && usage.weekly.limit <= 0) return null;
 
   return (
@@ -140,6 +141,11 @@ export default function CreditsPage() {
       <h1 className="mb-6 text-[28px] font-normal text-neutral-900 dark:text-neutral-100 sm:mb-8 sm:text-[35px]">
         Billing
       </h1>
+
+      {/* Subscription Tier */}
+      <div className="mb-8">
+        <SubscriptionTierSection />
+      </div>
 
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-2">
         {/* Top-up Form */}

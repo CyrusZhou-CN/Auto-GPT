@@ -1,6 +1,7 @@
 # This file contains a lot of prompt block strings that would trigger "line too long"
 # flake8: noqa: E501
 import logging
+import math
 import re
 import secrets
 from abc import ABC
@@ -13,6 +14,7 @@ import ollama
 import openai
 from anthropic.types import ToolParam
 from groq import AsyncGroq
+from openai.types.chat import ChatCompletion as OpenAIChatCompletion
 from pydantic import BaseModel, SecretStr
 
 from backend.blocks._base import (
@@ -48,6 +50,9 @@ from backend.util.text import TextFormatter
 settings = Settings()
 logger = TruncatedLogger(logging.getLogger(__name__), "[LLM-Block]")
 fmt = TextFormatter(autoescape=False)
+
+# HTTP status codes for user-caused errors that should not be reported to Sentry.
+USER_ERROR_STATUS_CODES = (401, 403, 429)
 
 LLMProviderName = Literal[
     ProviderName.AIML_API,
@@ -101,6 +106,18 @@ class LlmModelMeta(EnumMeta):
 
 
 class LlmModel(str, Enum, metaclass=LlmModelMeta):
+
+    @classmethod
+    def _missing_(cls, value: object) -> "LlmModel | None":
+        """Handle provider-prefixed model names like 'anthropic/claude-sonnet-4-6'."""
+        if isinstance(value, str) and "/" in value:
+            stripped = value.split("/", 1)[1]
+            try:
+                return cls(stripped)
+            except ValueError:
+                return None
+        return None
+
     # OpenAI models
     O3_MINI = "o3-mini"
     O3 = "o3-2025-04-16"
@@ -190,6 +207,19 @@ class LlmModel(str, Enum, metaclass=LlmModelMeta):
     KIMI_K2 = "moonshotai/kimi-k2"
     QWEN3_235B_A22B_THINKING = "qwen/qwen3-235b-a22b-thinking-2507"
     QWEN3_CODER = "qwen/qwen3-coder"
+    # Z.ai (Zhipu) models
+    ZAI_GLM_4_32B = "z-ai/glm-4-32b"
+    ZAI_GLM_4_5 = "z-ai/glm-4.5"
+    ZAI_GLM_4_5_AIR = "z-ai/glm-4.5-air"
+    ZAI_GLM_4_5_AIR_FREE = "z-ai/glm-4.5-air:free"
+    ZAI_GLM_4_5V = "z-ai/glm-4.5v"
+    ZAI_GLM_4_6 = "z-ai/glm-4.6"
+    ZAI_GLM_4_6V = "z-ai/glm-4.6v"
+    ZAI_GLM_4_7 = "z-ai/glm-4.7"
+    ZAI_GLM_4_7_FLASH = "z-ai/glm-4.7-flash"
+    ZAI_GLM_5 = "z-ai/glm-5"
+    ZAI_GLM_5_TURBO = "z-ai/glm-5-turbo"
+    ZAI_GLM_5V_TURBO = "z-ai/glm-5v-turbo"
     # Llama API models
     LLAMA_API_LLAMA_4_SCOUT = "Llama-4-Scout-17B-16E-Instruct-FP8"
     LLAMA_API_LLAMA4_MAVERICK = "Llama-4-Maverick-17B-128E-Instruct-FP8"
@@ -615,6 +645,43 @@ MODEL_METADATA = {
     LlmModel.QWEN3_CODER: ModelMetadata(
         "open_router", 262144, 262144, "Qwen 3 Coder", "OpenRouter", "Qwen", 3
     ),
+    # https://openrouter.ai/models?q=z-ai
+    LlmModel.ZAI_GLM_4_32B: ModelMetadata(
+        "open_router", 128000, 128000, "GLM 4 32B", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_5: ModelMetadata(
+        "open_router", 131072, 98304, "GLM 4.5", "OpenRouter", "Z.ai", 2
+    ),
+    LlmModel.ZAI_GLM_4_5_AIR: ModelMetadata(
+        "open_router", 131072, 98304, "GLM 4.5 Air", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_5_AIR_FREE: ModelMetadata(
+        "open_router", 131072, 96000, "GLM 4.5 Air (Free)", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_5V: ModelMetadata(
+        "open_router", 65536, 16384, "GLM 4.5V", "OpenRouter", "Z.ai", 2
+    ),
+    LlmModel.ZAI_GLM_4_6: ModelMetadata(
+        "open_router", 204800, 204800, "GLM 4.6", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_6V: ModelMetadata(
+        "open_router", 131072, 131072, "GLM 4.6V", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_7: ModelMetadata(
+        "open_router", 202752, 65535, "GLM 4.7", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_4_7_FLASH: ModelMetadata(
+        "open_router", 202752, 202752, "GLM 4.7 Flash", "OpenRouter", "Z.ai", 1
+    ),
+    LlmModel.ZAI_GLM_5: ModelMetadata(
+        "open_router", 80000, 80000, "GLM 5", "OpenRouter", "Z.ai", 2
+    ),
+    LlmModel.ZAI_GLM_5_TURBO: ModelMetadata(
+        "open_router", 202752, 131072, "GLM 5 Turbo", "OpenRouter", "Z.ai", 3
+    ),
+    LlmModel.ZAI_GLM_5V_TURBO: ModelMetadata(
+        "open_router", 202752, 131072, "GLM 5V Turbo", "OpenRouter", "Z.ai", 3
+    ),
     # Llama API models
     LlmModel.LLAMA_API_LLAMA_4_SCOUT: ModelMetadata(
         "llama_api",
@@ -671,17 +738,20 @@ class LLMResponse(BaseModel):
     tool_calls: Optional[List[ToolContentBlock]] | None
     prompt_tokens: int
     completion_tokens: int
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     reasoning: Optional[str] = None
+    provider_cost: float | None = None
 
 
 def convert_openai_tool_fmt_to_anthropic(
     openai_tools: list[dict] | None = None,
-) -> Iterable[ToolParam] | anthropic.Omit:
+) -> Iterable[ToolParam] | anthropic.NotGiven:
     """
     Convert OpenAI tool format to Anthropic tool format.
     """
     if not openai_tools or len(openai_tools) == 0:
-        return anthropic.omit
+        return anthropic.NOT_GIVEN
 
     anthropic_tools = []
     for tool in openai_tools:
@@ -706,9 +776,41 @@ def convert_openai_tool_fmt_to_anthropic(
     return anthropic_tools
 
 
+def extract_openrouter_cost(response: OpenAIChatCompletion) -> float | None:
+    """Extract OpenRouter's `x-total-cost` header from an OpenAI SDK response.
+
+    OpenRouter returns the per-request USD cost in a response header. The
+    OpenAI SDK exposes the raw httpx response via an undocumented `_response`
+    attribute. We use try/except AttributeError so that if the SDK ever drops
+    or renames that attribute, the warning is visible in logs rather than
+    silently degrading to no cost tracking.
+    """
+    try:
+        raw_resp = response._response  # type: ignore[attr-defined]
+    except AttributeError:
+        logger.warning(
+            "OpenAI SDK response missing _response attribute"
+            " — OpenRouter cost tracking unavailable"
+        )
+        return None
+    try:
+        cost_header = raw_resp.headers.get("x-total-cost")
+        if not cost_header:
+            return None
+        cost = float(cost_header)
+        if not math.isfinite(cost) or cost < 0:
+            return None
+        return cost
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def extract_openai_reasoning(response) -> str | None:
     """Extract reasoning from OpenAI-compatible response if available."""
     """Note: This will likely not working since the reasoning is not present in another Response API"""
+    if not response.choices:
+        logger.warning("LLM response has empty choices in extract_openai_reasoning")
+        return None
     reasoning = None
     choice = response.choices[0]
     if hasattr(choice, "reasoning") and getattr(choice, "reasoning", None):
@@ -724,6 +826,9 @@ def extract_openai_reasoning(response) -> str | None:
 
 def extract_openai_tool_calls(response) -> list[ToolContentBlock] | None:
     """Extract tool calls from OpenAI-compatible response."""
+    if not response.choices:
+        logger.warning("LLM response has empty choices in extract_openai_tool_calls")
+        return None
     if response.choices[0].message.tool_calls:
         return [
             ToolContentBlock(
@@ -782,6 +887,21 @@ async def llm_call(
     provider = llm_model.metadata.provider
     context_window = llm_model.context_window
 
+    # Transparent OpenRouter routing for Anthropic models: when an OpenRouter API key
+    # is configured, route direct-Anthropic models through OpenRouter instead. This
+    # gives us the x-total-cost header for free, so provider_cost is always populated
+    # without manual token-rate arithmetic.
+    or_key = settings.secrets.open_router_api_key
+    or_model_id: str | None = None
+    if provider == "anthropic" and or_key:
+        provider = "open_router"
+        credentials = APIKeyCredentials(
+            provider=ProviderName.OPEN_ROUTER,
+            title="OpenRouter (auto)",
+            api_key=SecretStr(or_key),
+        )
+        or_model_id = f"anthropic/{llm_model.value}"
+
     if compress_prompt_to_fit:
         result = await compress_context(
             messages=prompt,
@@ -795,6 +915,19 @@ async def llm_call(
                 f"Proceeding with {result.token_count} tokens."
             )
         prompt = result.messages
+
+    # Sanitize unpaired surrogates in message content to prevent
+    # UnicodeEncodeError when httpx encodes the JSON request body.
+    for msg in prompt:
+        content = msg.get("content")
+        if isinstance(content, str):
+            try:
+                content.encode("utf-8")
+            except UnicodeEncodeError:
+                logger.warning("Sanitized unpaired surrogates in LLM prompt content")
+                msg["content"] = content.encode("utf-8", errors="surrogatepass").decode(
+                    "utf-8", errors="replace"
+                )
 
     # Calculate available tokens based on context window and input length
     estimated_input_tokens = estimate_token_count(prompt)
@@ -856,6 +989,11 @@ async def llm_call(
     elif provider == "anthropic":
 
         an_tools = convert_openai_tool_fmt_to_anthropic(tools)
+        # Cache tool definitions alongside the system prompt.
+        # Placing cache_control on the last tool caches all tool schemas as a
+        # single prefix — reads cost 10% of normal input tokens.
+        if isinstance(an_tools, list) and an_tools:
+            an_tools[-1] = {**an_tools[-1], "cache_control": {"type": "ephemeral"}}
 
         system_messages = [p["content"] for p in prompt if p["role"] == "system"]
         sysprompt = " ".join(system_messages)
@@ -878,65 +1016,85 @@ async def llm_call(
         client = anthropic.AsyncAnthropic(
             api_key=credentials.api_key.get_secret_value()
         )
-        try:
-            resp = await client.messages.create(
-                model=llm_model.value,
-                system=sysprompt,
-                messages=messages,
-                max_tokens=max_tokens,
-                tools=an_tools,
-                timeout=600,
-            )
+        # create_kwargs is built as a plain dict so we can conditionally add
+        # the `system` field only when the prompt is non-empty.  Anthropic's
+        # API rejects empty text blocks (returns HTTP 400), so omitting the
+        # field is the correct behaviour for whitespace-only prompts.
+        create_kwargs: dict[str, Any] = dict(
+            model=llm_model.value,
+            messages=messages,
+            max_tokens=max_tokens,
+            # `an_tools` may be anthropic.NOT_GIVEN when no tools were
+            # configured. The SDK treats NOT_GIVEN as a sentinel meaning "omit
+            # this field from the serialized request", so passing it here is
+            # equivalent to not including the key at all — no `tools` field is
+            # sent to the API in that case.
+            tools=an_tools,
+            timeout=600,
+        )
+        if sysprompt.strip():
+            # Wrap the system prompt in a single cacheable text block.
+            # The guard intentionally omits `system` for whitespace-only
+            # prompts — Anthropic rejects empty text blocks with HTTP 400.
+            create_kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": sysprompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        resp = await client.messages.create(**create_kwargs)
 
-            if not resp.content:
-                raise ValueError("No content returned from Anthropic.")
+        if not resp.content:
+            raise ValueError("No content returned from Anthropic.")
 
-            tool_calls = None
-            for content_block in resp.content:
-                # Antropic is different to openai, need to iterate through
-                # the content blocks to find the tool calls
-                if content_block.type == "tool_use":
-                    if tool_calls is None:
-                        tool_calls = []
-                    tool_calls.append(
-                        ToolContentBlock(
-                            id=content_block.id,
-                            type=content_block.type,
-                            function=ToolCall(
-                                name=content_block.name,
-                                arguments=json.dumps(content_block.input),
-                            ),
-                        )
+        tool_calls = None
+        for content_block in resp.content:
+            # Antropic is different to openai, need to iterate through
+            # the content blocks to find the tool calls
+            if content_block.type == "tool_use":
+                if tool_calls is None:
+                    tool_calls = []
+                tool_calls.append(
+                    ToolContentBlock(
+                        id=content_block.id,
+                        type=content_block.type,
+                        function=ToolCall(
+                            name=content_block.name,
+                            arguments=json.dumps(content_block.input),
+                        ),
                     )
-
-            if not tool_calls and resp.stop_reason == "tool_use":
-                logger.warning(
-                    f"Tool use stop reason but no tool calls found in content. {resp}"
                 )
 
-            reasoning = None
-            for content_block in resp.content:
-                if hasattr(content_block, "type") and content_block.type == "thinking":
-                    reasoning = content_block.thinking
-                    break
-
-            return LLMResponse(
-                raw_response=resp,
-                prompt=prompt,
-                response=(
-                    resp.content[0].name
-                    if isinstance(resp.content[0], anthropic.types.ToolUseBlock)
-                    else getattr(resp.content[0], "text", "")
-                ),
-                tool_calls=tool_calls,
-                prompt_tokens=resp.usage.input_tokens,
-                completion_tokens=resp.usage.output_tokens,
-                reasoning=reasoning,
+        if not tool_calls and resp.stop_reason == "tool_use":
+            logger.warning(
+                f"Tool use stop reason but no tool calls found in content. {resp}"
             )
-        except anthropic.APIError as e:
-            error_message = f"Anthropic API error: {str(e)}"
-            logger.error(error_message)
-            raise ValueError(error_message)
+
+        reasoning = None
+        for content_block in resp.content:
+            if hasattr(content_block, "type") and content_block.type == "thinking":
+                reasoning = content_block.thinking
+                break
+
+        return LLMResponse(
+            raw_response=resp,
+            prompt=prompt,
+            response=(
+                resp.content[0].name
+                if isinstance(resp.content[0], anthropic.types.ToolUseBlock)
+                else getattr(resp.content[0], "text", "")
+            ),
+            tool_calls=tool_calls,
+            prompt_tokens=resp.usage.input_tokens,
+            completion_tokens=resp.usage.output_tokens,
+            cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", None) or 0,
+            cache_creation_tokens=getattr(
+                resp.usage, "cache_creation_input_tokens", None
+            )
+            or 0,
+            reasoning=reasoning,
+        )
     elif provider == "groq":
         if tools:
             raise ValueError("Groq does not support tools.")
@@ -949,6 +1107,8 @@ async def llm_call(
             response_format=response_format,  # type: ignore
             max_tokens=max_tokens,
         )
+        if not response.choices:
+            raise ValueError("Groq returned empty choices in response")
         return LLMResponse(
             raw_response=response.choices[0].message,
             prompt=prompt,
@@ -1001,19 +1161,15 @@ async def llm_call(
                 "HTTP-Referer": "https://agpt.co",
                 "X-Title": "AutoGPT",
             },
-            model=llm_model.value,
+            model=or_model_id or llm_model.value,
             messages=prompt,  # type: ignore
             max_tokens=max_tokens,
             tools=tools_param,  # type: ignore
             parallel_tool_calls=parallel_tool_calls_param,
         )
 
-        # If there's no response, raise an error
         if not response.choices:
-            if response:
-                raise ValueError(f"OpenRouter error: {response}")
-            else:
-                raise ValueError("No response from OpenRouter.")
+            raise ValueError(f"OpenRouter returned empty choices: {response}")
 
         tool_calls = extract_openai_tool_calls(response)
         reasoning = extract_openai_reasoning(response)
@@ -1026,6 +1182,7 @@ async def llm_call(
             prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
             completion_tokens=response.usage.completion_tokens if response.usage else 0,
             reasoning=reasoning,
+            provider_cost=extract_openrouter_cost(response),
         )
     elif provider == "llama_api":
         tools_param = tools if tools else openai.NOT_GIVEN
@@ -1050,12 +1207,8 @@ async def llm_call(
             parallel_tool_calls=parallel_tool_calls_param,
         )
 
-        # If there's no response, raise an error
         if not response.choices:
-            if response:
-                raise ValueError(f"Llama API error: {response}")
-            else:
-                raise ValueError("No response from Llama API.")
+            raise ValueError(f"Llama API returned empty choices: {response}")
 
         tool_calls = extract_openai_tool_calls(response)
         reasoning = extract_openai_reasoning(response)
@@ -1085,6 +1238,8 @@ async def llm_call(
             messages=prompt,  # type: ignore
             max_tokens=max_tokens,
         )
+        if not completion.choices:
+            raise ValueError("AI/ML API returned empty choices in response")
 
         return LLMResponse(
             raw_response=completion.choices[0].message,
@@ -1120,6 +1275,9 @@ async def llm_call(
             tools=tools_param,  # type: ignore
             parallel_tool_calls=parallel_tool_calls_param,
         )
+
+        if not response.choices:
+            raise ValueError(f"v0 API returned empty choices: {response}")
 
         tool_calls = extract_openai_tool_calls(response)
         reasoning = extract_openai_reasoning(response)
@@ -1332,6 +1490,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
 
         error_feedback_message = ""
         llm_model = input_data.model
+        total_provider_cost: float | None = None
 
         for retry_count in range(input_data.retry):
             logger.debug(f"LLM request: {prompt}")
@@ -1349,12 +1508,19 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
                     max_tokens=input_data.max_tokens,
                 )
                 response_text = llm_response.response
-                self.merge_stats(
-                    NodeExecutionStats(
-                        input_token_count=llm_response.prompt_tokens,
-                        output_token_count=llm_response.completion_tokens,
-                    )
+                # Accumulate token counts and provider_cost for every attempt
+                # (each call costs tokens and USD, regardless of validation outcome).
+                token_stats = NodeExecutionStats(
+                    input_token_count=llm_response.prompt_tokens,
+                    output_token_count=llm_response.completion_tokens,
+                    cache_read_token_count=llm_response.cache_read_tokens,
+                    cache_creation_token_count=llm_response.cache_creation_tokens,
                 )
+                self.merge_stats(token_stats)
+                if llm_response.provider_cost is not None:
+                    total_provider_cost = (
+                        total_provider_cost or 0.0
+                    ) + llm_response.provider_cost
                 logger.debug(f"LLM attempt-{retry_count} response: {response_text}")
 
                 if input_data.expected_format:
@@ -1423,6 +1589,7 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
                             NodeExecutionStats(
                                 llm_call_count=retry_count + 1,
                                 llm_retry_count=retry_count,
+                                provider_cost=total_provider_cost,
                             )
                         )
                         yield "response", response_obj
@@ -1443,13 +1610,23 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
                         NodeExecutionStats(
                             llm_call_count=retry_count + 1,
                             llm_retry_count=retry_count,
+                            provider_cost=total_provider_cost,
                         )
                     )
                     yield "response", {"response": response_text}
                     yield "prompt", self.prompt
                     return
             except Exception as e:
-                logger.exception(f"Error calling LLM: {e}")
+                is_user_error = (
+                    isinstance(e, (anthropic.APIStatusError, openai.APIStatusError))
+                    and e.status_code in USER_ERROR_STATUS_CODES
+                )
+                if is_user_error:
+                    logger.warning(f"Error calling LLM: {e}")
+                    error_feedback_message = f"Error calling LLM: {e}"
+                    break
+                else:
+                    logger.exception(f"Error calling LLM: {e}")
                 if (
                     "maximum context length" in str(e).lower()
                     or "token limit" in str(e).lower()
@@ -1465,6 +1642,10 @@ class AIStructuredResponseGeneratorBlock(AIBlockBase):
 
                 error_feedback_message = f"Error calling LLM: {e}"
 
+        # All retries exhausted or user-error break: persist accumulated cost so
+        # the executor can still charge/report the spend even on failure.
+        if total_provider_cost is not None:
+            self.merge_stats(NodeExecutionStats(provider_cost=total_provider_cost))
         raise RuntimeError(error_feedback_message)
 
     def response_format_instructions(
@@ -1979,6 +2160,19 @@ class AIConversationBlock(AIBlockBase):
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
+        has_messages = any(
+            isinstance(m, dict)
+            and isinstance(m.get("content"), str)
+            and bool(m["content"].strip())
+            for m in (input_data.messages or [])
+        )
+        has_prompt = bool(input_data.prompt and input_data.prompt.strip())
+        if not has_messages and not has_prompt:
+            raise ValueError(
+                "Cannot call LLM with no messages and no prompt. "
+                "Provide at least one message or a non-empty prompt."
+            )
+
         response = await self.llm_call(
             AIStructuredResponseGeneratorBlock.Input(
                 prompt=input_data.prompt,

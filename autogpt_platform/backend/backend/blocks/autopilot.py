@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from typing_extensions import TypedDict  # Needed for Python <3.12 compatibility
@@ -15,6 +16,12 @@ from backend.blocks._base import (
     BlockSchemaInput,
     BlockSchemaOutput,
 )
+from backend.copilot.permissions import (
+    CopilotPermissions,
+    ToolName,
+    all_known_tool_names,
+    validate_block_identifiers,
+)
 from backend.data.model import SchemaField
 
 if TYPE_CHECKING:
@@ -24,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Block ID shared between autopilot.py and copilot prompting.py.
 AUTOPILOT_BLOCK_ID = "c069dc6b-c3ed-4c12-b6e5-d47361e64ce6"
+
+
+class SubAgentRecursionError(RuntimeError):
+    """Raised when the sub-agent nesting depth limit is exceeded."""
 
 
 class ToolCallEntry(TypedDict):
@@ -93,6 +104,65 @@ class AutoPilotBlock(Block):
             default=3,
             ge=1,
             le=10,
+            advanced=True,
+        )
+
+        tools: list[ToolName] = SchemaField(
+            description=(
+                "Tool names to filter. Works with tools_exclude to form an "
+                "allow-list or deny-list. "
+                "Leave empty to apply no tool filter."
+            ),
+            default=[],
+            advanced=True,
+        )
+
+        tools_exclude: bool = SchemaField(
+            description=(
+                "Controls how the 'tools' list is interpreted. "
+                "True (default): 'tools' is a deny-list — listed tools are blocked, "
+                "all others are allowed. An empty 'tools' list means allow everything. "
+                "False: 'tools' is an allow-list — only listed tools are permitted."
+            ),
+            default=True,
+            advanced=True,
+        )
+
+        blocks: list[str] = SchemaField(
+            description=(
+                "Block identifiers to filter when the copilot uses run_block. "
+                "Each entry can be: a block name (e.g. 'HTTP Request'), "
+                "a full block UUID, or the first 8 hex characters of the UUID "
+                "(e.g. 'c069dc6b'). Works with blocks_exclude. "
+                "Leave empty to apply no block filter."
+            ),
+            default=[],
+            advanced=True,
+        )
+
+        blocks_exclude: bool = SchemaField(
+            description=(
+                "Controls how the 'blocks' list is interpreted. "
+                "True (default): 'blocks' is a deny-list — listed blocks are blocked, "
+                "all others are allowed. An empty 'blocks' list means allow everything. "
+                "False: 'blocks' is an allow-list — only listed blocks are permitted."
+            ),
+            default=True,
+            advanced=True,
+        )
+
+        dry_run: bool = SchemaField(
+            description=(
+                "When enabled, run_block and run_agent tool calls in this "
+                "autopilot session are forced to use dry-run simulation mode. "
+                "No real API calls, side effects, or credits are consumed "
+                "by those tools. Useful for testing agent wiring and "
+                "previewing outputs. "
+                "Only applies when creating a new session (session_id is empty). "
+                "When reusing an existing session_id, the session's original "
+                "dry_run setting is preserved."
+            ),
+            default=False,
             advanced=True,
         )
 
@@ -182,11 +252,11 @@ class AutoPilotBlock(Block):
             },
         )
 
-    async def create_session(self, user_id: str) -> str:
+    async def create_session(self, user_id: str, *, dry_run: bool) -> str:
         """Create a new chat session and return its ID (mockable for tests)."""
-        from backend.copilot.model import create_chat_session
+        from backend.copilot.model import create_chat_session  # avoid circular import
 
-        session = await create_chat_session(user_id)
+        session = await create_chat_session(user_id, dry_run=dry_run)
         return session.session_id
 
     async def execute_copilot(
@@ -196,6 +266,7 @@ class AutoPilotBlock(Block):
         session_id: str,
         max_recursion_depth: int,
         user_id: str,
+        permissions: "CopilotPermissions | None" = None,
     ) -> tuple[str, list[ToolCallEntry], str, str, TokenUsage]:
         """Invoke the copilot and collect all stream results.
 
@@ -209,14 +280,21 @@ class AutoPilotBlock(Block):
             session_id: Chat session to use.
             max_recursion_depth: Maximum allowed recursion nesting.
             user_id: Authenticated user ID.
+            permissions: Optional capability filter restricting tools/blocks.
 
         Returns:
             A tuple of (response_text, tool_calls, history_json, session_id, usage).
         """
-        from backend.copilot.sdk.collect import collect_copilot_response
+        from backend.copilot.sdk.collect import (
+            collect_copilot_response,  # avoid circular import
+        )
 
         tokens = _check_recursion(max_recursion_depth)
+        perm_token = None
         try:
+            effective_permissions, perm_token = _merge_inherited_permissions(
+                permissions
+            )
             effective_prompt = prompt
             if system_context:
                 effective_prompt = f"[System Context: {system_context}]\n\n{prompt}"
@@ -225,6 +303,7 @@ class AutoPilotBlock(Block):
                 session_id=session_id,
                 message=effective_prompt,
                 user_id=user_id,
+                permissions=effective_permissions,
             )
 
             # Build a lightweight conversation summary from streamed data.
@@ -271,6 +350,8 @@ class AutoPilotBlock(Block):
             )
         finally:
             _reset_recursion(tokens)
+            if perm_token is not None:
+                _inherited_permissions.reset(perm_token)
 
     async def run(
         self,
@@ -295,11 +376,21 @@ class AutoPilotBlock(Block):
             yield "error", "max_recursion_depth must be at least 1."
             return
 
+        # Validate and build permissions eagerly — fail before creating a session.
+        permissions = await _build_and_validate_permissions(input_data)
+        if isinstance(permissions, str):
+            # Validation error returned as a string message.
+            yield "error", permissions
+            return
+
         # Create session eagerly so the user always gets the session_id,
         # even if the downstream stream fails (avoids orphaned sessions).
         sid = input_data.session_id
         if not sid:
-            sid = await self.create_session(execution_context.user_id)
+            sid = await self.create_session(
+                execution_context.user_id,
+                dry_run=input_data.dry_run or execution_context.dry_run,
+            )
 
         # NOTE: No asyncio.timeout() here — the SDK manages its own
         # heartbeat-based timeouts internally.  Wrapping with asyncio.timeout
@@ -312,6 +403,7 @@ class AutoPilotBlock(Block):
                 session_id=sid,
                 max_recursion_depth=input_data.max_recursion_depth,
                 user_id=execution_context.user_id,
+                permissions=permissions,
             )
 
             yield "response", response
@@ -323,8 +415,41 @@ class AutoPilotBlock(Block):
             yield "session_id", sid
             yield "error", "AutoPilot execution was cancelled."
             raise
+        except SubAgentRecursionError as exc:
+            # Deliberate block — re-enqueueing would immediately hit the limit
+            # again, so skip recovery and just surface the error.
+            yield "session_id", sid
+            yield "error", str(exc)
         except Exception as exc:
             yield "session_id", sid
+            # Recovery enqueue must happen BEFORE yielding "error": the block
+            # framework (_base.execute) raises BlockExecutionError immediately
+            # when it sees ("error", ...) and stops consuming the generator,
+            # so any code after that yield is dead code in production.
+            effective_prompt = input_data.prompt
+            if input_data.system_context:
+                effective_prompt = (
+                    f"[System Context: {input_data.system_context}]\n\n"
+                    f"{input_data.prompt}"
+                )
+            try:
+                await _enqueue_for_recovery(
+                    sid,
+                    execution_context.user_id,
+                    effective_prompt,
+                    input_data.dry_run or execution_context.dry_run,
+                )
+            except asyncio.CancelledError:
+                # Task cancelled during recovery — still yield the error
+                # so the session_id + error pair is visible before re-raising.
+                yield "error", str(exc)
+                raise
+            except Exception:
+                logger.warning(
+                    "AutoPilot session %s: recovery enqueue raised unexpectedly",
+                    sid[:12],
+                    exc_info=True,
+                )
             yield "error", str(exc)
 
 
@@ -352,13 +477,13 @@ def _check_recursion(
     when the caller exits to restore the previous depth.
 
     Raises:
-        RuntimeError: If the current depth already meets or exceeds the limit.
+        SubAgentRecursionError: If the current depth already meets or exceeds the limit.
     """
     current = _autopilot_recursion_depth.get()
     inherited = _autopilot_recursion_limit.get()
     limit = max_depth if inherited is None else min(inherited, max_depth)
     if current >= limit:
-        raise RuntimeError(
+        raise SubAgentRecursionError(
             f"AutoPilot recursion depth limit reached ({limit}). "
             "The autopilot has called itself too many times."
         )
@@ -374,3 +499,126 @@ def _reset_recursion(
     """Restore recursion depth and limit to their previous values."""
     _autopilot_recursion_depth.reset(tokens[0])
     _autopilot_recursion_limit.reset(tokens[1])
+
+
+# ---------------------------------------------------------------------------
+# Permission helpers
+# ---------------------------------------------------------------------------
+
+# Inherited permissions from a parent AutoPilotBlock execution.
+# This acts as a ceiling: child executions can only be more restrictive.
+_inherited_permissions: contextvars.ContextVar["CopilotPermissions | None"] = (
+    contextvars.ContextVar("_inherited_permissions", default=None)
+)
+
+
+async def _build_and_validate_permissions(
+    input_data: "AutoPilotBlock.Input",
+) -> "CopilotPermissions | str":
+    """Build a :class:`CopilotPermissions` from block input and validate it.
+
+    Returns a :class:`CopilotPermissions` on success or a human-readable
+    error string if validation fails.
+    """
+    # Tool names are validated by Pydantic via the ToolName Literal type
+    # at model construction time — no runtime check needed here.
+    # Validate block identifiers against live block registry.
+    if input_data.blocks:
+        invalid_blocks = await validate_block_identifiers(input_data.blocks)
+        if invalid_blocks:
+            return (
+                f"Unknown block identifier(s) in 'blocks': {invalid_blocks}. "
+                "Use find_block to discover valid block names and IDs. "
+                "You may also use the first 8 characters of a block UUID."
+            )
+
+    return CopilotPermissions(
+        tools=list(input_data.tools),
+        tools_exclude=input_data.tools_exclude,
+        blocks=input_data.blocks,
+        blocks_exclude=input_data.blocks_exclude,
+    )
+
+
+def _merge_inherited_permissions(
+    permissions: "CopilotPermissions | None",
+) -> "tuple[CopilotPermissions | None, contextvars.Token[CopilotPermissions | None] | None]":
+    """Merge *permissions* with any inherited parent permissions.
+
+    The merged result is stored back into the contextvar so that any nested
+    AutoPilotBlock invocation (sub-agent) inherits the merged ceiling.
+
+    Returns a tuple of (merged_permissions, reset_token).  The caller MUST
+    reset the contextvar via ``_inherited_permissions.reset(token)`` in a
+    ``finally`` block when ``reset_token`` is not None — this prevents
+    permission leakage between sequential independent executions in the same
+    asyncio task.
+    """
+    parent = _inherited_permissions.get()
+
+    if permissions is None and parent is None:
+        return None, None
+
+    all_tools = all_known_tool_names()
+
+    if permissions is None:
+        permissions = CopilotPermissions()  # allow-all; will be narrowed by parent
+
+    merged = (
+        permissions.merged_with_parent(parent, all_tools)
+        if parent is not None
+        else permissions
+    )
+
+    # Store merged permissions as the new inherited ceiling for nested calls.
+    # Return the token so the caller can restore the previous value in finally.
+    token = _inherited_permissions.set(merged)
+    return merged, token
+
+
+# ---------------------------------------------------------------------------
+# Recovery helpers
+# ---------------------------------------------------------------------------
+
+
+async def _enqueue_for_recovery(
+    session_id: str,
+    user_id: str,
+    message: str,
+    dry_run: bool,
+) -> None:
+    """Re-enqueue an orphaned sub-agent session so a fresh executor picks it up.
+
+    When ``execute_copilot`` raises an unexpected exception the sub-agent
+    session is left with ``last_role=user`` and no active consumer — identical
+    to the state that caused Toran's reports of silent sub-agents.  Publishing
+    the original prompt back to the copilot queue lets the executor service
+    resume the session without manual intervention.
+
+    Skipped for dry-run sessions (no real consumers listen to the queue for
+    simulated sessions).  Any failure to publish is logged and swallowed so
+    it never masks the original exception.
+    """
+    if dry_run:
+        return
+    try:
+        from backend.copilot.executor.utils import (  # avoid circular import
+            enqueue_copilot_turn,
+        )
+
+        await asyncio.wait_for(
+            enqueue_copilot_turn(
+                session_id=session_id,
+                user_id=user_id,
+                message=message,
+                turn_id=str(uuid.uuid4()),
+            ),
+            timeout=10,
+        )
+        logger.info("AutoPilot session %s enqueued for recovery", session_id[:12])
+    except Exception:
+        logger.warning(
+            "AutoPilot session %s: failed to enqueue for recovery",
+            session_id[:12],
+            exc_info=True,
+        )
