@@ -8,6 +8,7 @@ from typing import (
     Callable,
     ClassVar,
     Generic,
+    Literal,
     Optional,
     Type,
     TypeAlias,
@@ -18,6 +19,7 @@ from typing import (
 
 import jsonref
 import jsonschema
+from jsonschema.validators import validator_for as _jsonschema_validator_for
 from pydantic import BaseModel, Field
 
 from backend.data.block import BlockInput, BlockOutput, BlockOutputEntry
@@ -37,6 +39,7 @@ from backend.util.exceptions import (
     BlockInputError,
     BlockOutputError,
     BlockUnknownError,
+    InsufficientBalanceError,
 )
 from backend.util.settings import Config
 
@@ -52,6 +55,13 @@ app_config = Config()
 
 
 BlockTestOutput = BlockOutputEntry | tuple[str, Callable[[Any], bool]]
+
+
+# How the copilot ranks a block when it is offered as a capability.  A
+# ``service`` block acts on one named integration (Gmail, Linear, ...); a
+# ``primitive`` is a generic building block (HTTP, SQL, code, LLM calls) that
+# can reach many services and so ranks below a matching service capability.
+CapabilityKind = Literal["service", "primitive"]
 
 
 class BlockType(Enum):
@@ -255,6 +265,46 @@ class BlockSchema(BaseModel):
     @classmethod
     def get_mismatch_error(cls, data: BlockInput) -> str | None:
         return cls.validate_data(data)
+
+    # JSON-schema keywords whose violations are NOT already prevented at the
+    # widget level (number bounds and length bounds are bypassable by typing
+    # or pasting). ``enum``/``const`` come from dropdowns and ``pattern``/
+    # ``multipleOf``/``type`` are enforced by custom render rules, so leaving
+    # them out avoids surfacing errors the user can't actually trigger.
+    _INLINE_FIELD_ERROR_KEYWORDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+        }
+    )
+
+    @classmethod
+    def get_field_errors(cls, data: BlockInput) -> dict[str, str]:
+        """
+        Validate ``data`` against this schema and return per-field errors for
+        violations that are not already blocked by the form widget — i.e.
+        bound checks the user can bypass by typing/pasting. Lets these surface
+        inline on the offending block field via the standard ``node_errors``
+        path, rather than as a single string raised at execute time.
+        """
+        schema = cls.jsonschema()
+        cleaned = {k: v for k, v in data.items() if v is not None}
+        validator_cls = _jsonschema_validator_for(schema)
+        errors: dict[str, str] = {}
+        for err in validator_cls(schema).iter_errors(cleaned):
+            if err.validator not in cls._INLINE_FIELD_ERROR_KEYWORDS:
+                continue
+            if not err.absolute_path:
+                continue
+            field = str(err.absolute_path[0])
+            errors.setdefault(field, err.message)
+        return errors
 
     @classmethod
     def get_field_schema(cls, field_name: str) -> dict[str, Any]:
@@ -499,7 +549,7 @@ class BlockWebhookConfig(BlockManualWebhookConfig):
 
 
 # Default wall-clock cap on a single block-run invocation. Leaf compute blocks
-# inherit this; coordination blocks (AgentExecutor, AutoPilot) override their
+# inherit this; coordination blocks (AgentExecutor, Otto) override their
 # instance attribute to None to opt out. The executor consults
 # `block.execution_timeout_seconds` and only wraps `run` in `wait_for` when
 # the value is not None.
@@ -527,6 +577,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         block_type: BlockType = BlockType.STANDARD,
         webhook_config: Optional[BlockWebhookConfig | BlockManualWebhookConfig] = None,
         is_sensitive_action: bool = False,
+        capability_kind: CapabilityKind | None = None,
     ):
         """
         Initialize the block with the given schema.
@@ -544,6 +595,10 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             test_mock: function names on the block implementation to mock on test run.
             disabled: If the block is disabled, it will not be available for execution.
             static_output: Whether the output links of the block are static by default.
+            capability_kind: How the copilot ranks this block as a capability.
+                Defaults to ``service`` when the block's credentials name exactly
+                one provider and ``primitive`` otherwise; set it explicitly on
+                provider-backed generic blocks (code sandboxes, SQL, HTTP).
         """
         self.id = id
         self.input_schema = input_schema
@@ -560,6 +615,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         self.block_type = block_type
         self.webhook_config = webhook_config
         self.is_sensitive_action = is_sensitive_action
+        self._capability_kind: CapabilityKind | None = capability_kind
         # Read from ClassVar set by initialize_blocks()
         self.optimized_description: str | None = type(self)._optimized_description
         self.execution_stats: NodeExecutionStats = NodeExecutionStats()
@@ -650,6 +706,38 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
     def name(self):
         return self.__class__.__name__
 
+    @property
+    def capability_kind(self) -> CapabilityKind:
+        """``service`` for a block bound to one integration, else ``primitive``.
+
+        Explicit ``capability_kind`` wins.  Otherwise a block whose credential
+        inputs name exactly one provider is a service; blocks with no
+        credentials, or with a choice of providers (the LLM blocks), are
+        primitives.
+        """
+        if self._capability_kind is not None:
+            return self._capability_kind
+        try:
+            providers = {
+                provider
+                for info in self.input_schema.get_credentials_fields_info().values()
+                for provider in info.provider
+            }
+        except Exception:
+            # This runs while the block registry is being built, so one block
+            # with a malformed credentials schema would otherwise take the
+            # whole platform down at startup. "primitive" is the safe read:
+            # it only costs this block some ranking weight.
+            logger.warning(
+                "Could not read credentials for %s; treating it as a primitive",
+                self.name,
+                exc_info=True,
+            )
+            return "primitive"
+        if len(providers) == 1:
+            return "service"
+        return "primitive"
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -683,13 +771,21 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             uiType=self.block_type.value,
         )
 
-    async def execute(self, input_data: BlockInput, **kwargs) -> BlockOutput:
+    async def execute(
+        self,
+        input_data: BlockInput,
+        *,
+        execution_context: "ExecutionContext",
+        **kwargs,
+    ) -> BlockOutput:
         try:
-            async for output_name, output_data in self._execute(input_data, **kwargs):
+            async for output_name, output_data in self._execute(
+                input_data, execution_context=execution_context, **kwargs
+            ):
                 yield output_name, output_data
         except Exception as ex:
-            if isinstance(ex, BlockError):
-                raise ex
+            if isinstance(ex, (BlockError, InsufficientBalanceError)):
+                raise
             else:
                 raise (
                     BlockExecutionError
@@ -742,6 +838,8 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             block_name=self.name,
             editable=True,
             is_graph_execution=is_graph_execution,
+            organization_id=execution_context.organization_id,
+            team_id=execution_context.team_id,
         )
 
         if decision is None:
@@ -767,21 +865,19 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             )
         return False, reviewed_data
 
-    async def _execute(self, input_data: BlockInput, **kwargs) -> BlockOutput:
-        # Check for review requirement only if running within a graph execution context
-        # Direct block execution (e.g., from chat) skips the review process
-        has_graph_context = all(
-            key in kwargs
-            for key in (
-                "node_exec_id",
-                "graph_exec_id",
-                "graph_id",
-                "execution_context",
-            )
-        )
-        if has_graph_context:
+    async def _execute(
+        self,
+        input_data: BlockInput,
+        *,
+        execution_context: "ExecutionContext",
+        **kwargs,
+    ) -> BlockOutput:
+        # Review is only meaningful inside a graph execution. Direct block
+        # execution (e.g. from the /blocks/{id}/execute API) has no graph
+        # context and skips the review path.
+        if execution_context.graph_exec_id is not None:
             should_pause, input_data = await self.is_block_exec_need_review(
-                input_data, **kwargs
+                input_data, execution_context=execution_context, **kwargs
             )
             if should_pause:
                 return
@@ -791,7 +887,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         # that would fail JSON schema required checks.  We still validate the
         # non-credential fields so blocks that execute for real during dry-run
         # (e.g. AgentExecutorBlock) get proper input validation.
-        is_dry_run = getattr(kwargs.get("execution_context"), "dry_run", False)
+        is_dry_run = execution_context.dry_run
         if is_dry_run:
             # Credential fields may be absent (LLM-built agents often skip
             # wiring them) or nullified earlier in the pipeline. Validate
@@ -874,6 +970,7 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         # Use the validated input data
         async for output_name, output_data in self.run(
             self.input_schema(**{k: v for k, v in input_data.items() if v is not None}),
+            execution_context=execution_context,
             **kwargs,
         ):
             if output_name == "error":
