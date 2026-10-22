@@ -4,6 +4,7 @@ import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
 import { Text } from "@/components/atoms/Text/Text";
 import { ErrorCard } from "@/components/molecules/ErrorCard/ErrorCard";
 import { cn } from "@/lib/utils";
+import { TrialCanceledDialog } from "./TrialCanceledDialog/TrialCanceledDialog";
 import { TrialOffer } from "./TrialOffer";
 import { TrialStatus } from "./TrialStatus";
 import { useTrialCard } from "./useTrialCard";
@@ -13,6 +14,14 @@ interface Props {
 }
 
 export function TrialCard({ returnTo = "billing" }: Props) {
+  const controller = useTrialCard(returnTo);
+  return <TrialCardContent returnTo={returnTo} controller={controller} />;
+}
+
+export function TrialCardContent({
+  returnTo = "billing",
+  controller,
+}: Props & { controller: ReturnType<typeof useTrialCard> }) {
   const {
     userID,
     trial,
@@ -22,9 +31,14 @@ export function TrialCard({ returnTo = "billing" }: Props) {
     retry,
     isStarting,
     isCanceling,
+    isResuming,
     startTrial,
     cancelTrial,
-  } = useTrialCard(returnTo);
+    resumeTrial,
+    showCanceledDialog,
+    dismissCanceledDialog,
+    subscribeNow,
+  } = controller;
   const isBilling = returnTo === "billing";
   if (isLoading)
     return (
@@ -57,6 +71,8 @@ export function TrialCard({ returnTo = "billing" }: Props) {
           trial={trial}
           isCanceling={isCanceling}
           onCancel={cancelTrial}
+          isResuming={isResuming}
+          onResume={resumeTrial}
         />
       )}
       {error ? (
@@ -64,6 +80,14 @@ export function TrialCard({ returnTo = "billing" }: Props) {
           {error}
         </p>
       ) : null}
+      <TrialCanceledDialog
+        trial={trial}
+        isOpen={showCanceledDialog}
+        isResuming={isResuming}
+        onResume={resumeTrial}
+        onSubscribe={subscribeNow}
+        onClose={dismissCanceledDialog}
+      />
     </>
   );
   if (isBilling)

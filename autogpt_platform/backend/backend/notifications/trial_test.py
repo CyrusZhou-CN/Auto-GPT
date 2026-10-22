@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -53,6 +54,7 @@ def trial() -> TrialState:
 @pytest.fixture
 def urls() -> EmailUrls:
     return EmailUrls(
+        chat="https://example.com/copilot",
         dashboard="https://example.com/library",
         settings="https://example.com/settings",
         unsubscribe="https://example.com/unsubscribe",
@@ -63,6 +65,33 @@ def urls() -> EmailUrls:
         docs="https://example.com/docs",
         discord="https://example.com/discord",
     )
+
+
+@pytest.mark.parametrize("cycle,cycle_noun", [("monthly", "month"), ("yearly", "year")])
+@pytest.mark.parametrize(
+    "currency,formatted_amount",
+    [
+        ("usd", "$20.00"),
+        ("eur", "€20.00"),
+        ("gbp", "£20.00"),
+        ("cad", "20.00 CAD"),
+        ("jpy", "2,000 JPY"),
+    ],
+)
+def test_trial_plan_uses_design_labels_and_unambiguous_prices(
+    trial, urls, cycle, cycle_noun, currency, formatted_amount
+):
+    trial.offer = trial.offer.model_copy(
+        update={"billing_cycle": cycle, "currency": currency}
+    )
+    data = notices.trial_notice_data(trial, "ending", "Sam")
+
+    assert data.plan.label == f"Pro · {cycle}"
+    assert data.plan.price_display == f"{formatted_amount} / {cycle_noun}"
+    email = render(NotificationType.TRIAL_UPDATE, data, "sam@example.com", urls)
+    for body in (email.html, email.text):
+        assert data.plan.label in body
+        assert data.plan.price_display in body
 
 
 @pytest.mark.parametrize(
@@ -82,7 +111,7 @@ def test_all_trial_notices_render_exact_terms_and_billing_link(trial, urls, kind
     email = render(NotificationType.TRIAL_UPDATE, data, "sam@example.com", urls)
     assert email.subject and email.preheader
     for body in (email.html, email.text):
-        assert "$20.00 USD / month" in body
+        assert "$20.00 / month" in body
         assert data.ends_label in body
         assert urls.billing in body
     if kind == "payment_failed":
@@ -138,7 +167,15 @@ async def test_notice_uses_shared_notification_queue(trial, outcome):
             notices,
             "user_db",
             return_value=MagicMock(
-                get_user_by_id=AsyncMock(return_value=SimpleNamespace(name="Sam"))
+                get_user_by_id=AsyncMock(
+                    return_value=SimpleNamespace(
+                        id="user-1",
+                        name="Sam",
+                        email="sam@example.com",
+                        marketing_opt_out_at=None,
+                        timezone="America/Chicago",
+                    )
+                )
             ),
         ),
         patch.object(
@@ -166,6 +203,18 @@ async def test_notice_uses_shared_notification_queue(trial, outcome):
     else:
         release.assert_not_awaited()
     assert track.call_count == int(outcome == "sent")
+    if outcome == "sent":
+        assert track.call_args.args[0] == "trial_started"
+
+
+def test_every_trial_notice_kind_has_the_analytics_plan_event_name():
+    """Every kind maps to the analytics plan's ``trial_*`` name; a failed
+    conversion charge is the plan's ``payment_failed``."""
+    kinds = get_args(notices.TrialNoticeKind)
+    assert set(notices.TRIAL_NOTICE_EVENTS) == set(kinds)
+    for kind in kinds:
+        expected = "payment_failed" if kind == "payment_failed" else f"trial_{kind}"
+        assert notices.TRIAL_NOTICE_EVENTS[kind].value == expected
 
 
 def test_canceled_trial_suppresses_late_ending_reminder(trial):

@@ -11,6 +11,13 @@ This guide provides context for coding agents when updating the **autogpt_platfo
 
 See `docs/platform/getting-started.md` for setup instructions.
 
+## Documentation
+
+- `docs/home/`, `docs/platform/` and `docs/integrations/` are the public docs site (agpt.co/docs). Only pages written for people outside the team go there: people using, self-hosting or contributing to AutoGPT.
+- The team's working documents go in `docs/engineering/`, which is not on the docs site: analytics and tracking plans, rollout plans, runbooks, internal references, and design and architecture notes. It is still public, like the rest of the repository, so no secrets or confidential material.
+
+See `docs/AGENTS.md` before adding a document.
+
 ## Code style
 
 - Format Python code with `poetry run format`.
@@ -56,6 +63,9 @@ Always run the relevant linters and tests before committing.
 Use conventional commit messages for all commits (e.g. `feat(backend): add API`).
 Types: - feat - fix - refactor - ci - dx (developer experience)
 Scopes: - platform - platform/library - platform/marketplace - backend - backend/executor - frontend - frontend/library - frontend/marketplace - blocks
+
+For a change that is complex always add an e2e test that tests the principle input and output and never the inner logic. 
+For example: if we add a agent billing per turn of a session we should have a test that is 3 turns each at 1.2 cents and the final is 3.6 cents actually billed
 
 ## Commit attribution
 

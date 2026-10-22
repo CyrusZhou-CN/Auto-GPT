@@ -15,8 +15,13 @@ import { ChatContainer } from "../ChatContainer";
 import { useCopilotUIStore } from "../../../store";
 
 const mockIsUsageLimitReached = vi.fn();
-const mockArtifactsEnabled = vi.fn(() => false);
 const clipboardWrite = vi.fn(async (_text: string) => {});
+const toast = vi.hoisted(() => vi.fn());
+
+vi.mock("@/components/molecules/Toast/use-toast", () => ({
+  toast,
+  useToast: () => ({ toast, dismiss: vi.fn() }),
+}));
 
 const ARTIFACT_A_ID = "11111111-0000-0000-0000-000000000000";
 const ARTIFACT_B_ID = "22222222-0000-0000-0000-000000000000";
@@ -112,10 +117,8 @@ vi.mock("@/app/(platform)/copilot/components/ChatInput/ChatInput", () => ({
 }));
 
 vi.mock("@/services/feature-flags/use-get-flag", () => ({
-  Flag: {
-    ARTIFACTS: "ARTIFACTS",
-  },
-  useGetFlag: () => mockArtifactsEnabled(),
+  Flag: { TASK_PROGRESS_BAR: "TASK_PROGRESS_BAR" },
+  useGetFlag: () => false,
 }));
 
 vi.mock("../../ChatMessagesContainer/ChatMessagesContainer", () => ({
@@ -195,7 +198,6 @@ const baseProps = {
 describe("ChatContainer", () => {
   beforeEach(() => {
     mockIsUsageLimitReached.mockReturnValue(false);
-    mockArtifactsEnabled.mockReturnValue(false);
     mockShareState({ is_shared: false });
     resetCopilotStore();
     Object.defineProperty(navigator, "clipboard", {
@@ -212,9 +214,22 @@ describe("ChatContainer", () => {
     vi.clearAllMocks();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
+  // Radix opens a tooltip on a timer and arms its Escape handler a render
+  // after the tooltip appears. Run the delay on a fake clock inside act() so
+  // the tooltip is fully mounted before the next interaction, however slow
+  // the machine.
+  async function hoverUsageTooltipTrigger(trigger: HTMLElement) {
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    await act(async () => {
+      vi.runOnlyPendingTimers();
+    });
+  }
+
   it("keeps usage tooltips hoverable and dismissible as the limit changes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { rerender } = render(<ChatContainer {...baseProps} />);
     const input = screen.getByTestId("chat-input");
@@ -227,11 +242,10 @@ describe("ChatContainer", () => {
     expect((input as HTMLInputElement).value).toBe("Unsent draft");
     expect(screen.queryByRole("tooltip")).toBeNull();
 
-    fireEvent.pointerMove(input.parentElement!, { pointerType: "mouse" });
-    expect(await screen.findByRole("tooltip")).toBeDefined();
-    await act(async () => {});
+    await hoverUsageTooltipTrigger(input.parentElement!);
+    expect(screen.getByRole("tooltip")).toBeDefined();
     fireEvent.keyDown(document, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    expect(screen.queryByRole("tooltip")).toBeNull();
 
     mockIsUsageLimitReached.mockReturnValue(false);
     rerender(<ChatContainer {...baseProps} />);
@@ -240,6 +254,29 @@ describe("ChatContainer", () => {
       /controlled|uncontrolled/,
     );
     consoleWarn.mockRestore();
+  });
+
+  it("opens the usage tooltip only for a hover made while the limit is reached", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { rerender } = render(<ChatContainer {...baseProps} />);
+    const trigger = screen.getByTestId("chat-input").parentElement!;
+
+    // Hovering the composer before the limit is reached.
+    await hoverUsageTooltipTrigger(trigger);
+    fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+    mockIsUsageLimitReached.mockReturnValue(true);
+    rerender(<ChatContainer {...baseProps} />);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    // The limit lifting while the tooltip shows.
+    await hoverUsageTooltipTrigger(trigger);
+    expect(screen.getByRole("tooltip")).toBeDefined();
+    mockIsUsageLimitReached.mockReturnValue(false);
+    rerender(<ChatContainer {...baseProps} />);
+    fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+    mockIsUsageLimitReached.mockReturnValue(true);
+    rerender(<ChatContainer {...baseProps} />);
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
   it("renders the blurred usage-limit backdrop only when the limit is reached", () => {
@@ -299,6 +336,151 @@ describe("ChatContainer", () => {
     );
   });
 
+  it("resumes a failed turn an answered card started instead of re-sending a request", () => {
+    const onSend = vi.fn();
+    render(
+      <ChatContainer
+        {...baseProps}
+        onSend={onSend}
+        messages={[
+          {
+            id: "ask",
+            role: "user",
+            parts: [{ type: "text", text: "make two folders" }],
+          },
+          {
+            id: "result",
+            role: "user",
+            parts: [
+              {
+                type: "text",
+                text: "<held_call_result>made</held_call_result>",
+              },
+            ],
+            metadata: { held_call: { review_id: "r1" } },
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry message" }));
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0]).toBe("Continue from where you left off.");
+  });
+
+  it.each([false, true])(
+    "shows an error when retrying fails (held call: %s)",
+    async (isHeldCall) => {
+      const failure = Promise.reject(new Error("Could not reach the server"));
+      void failure.catch(() => undefined);
+      const onSend = vi.fn((_message: string) => failure);
+      render(
+        <ChatContainer
+          {...baseProps}
+          error={new Error("The model returned an empty response.")}
+          onSend={onSend}
+          messages={[
+            {
+              id: "failed-request",
+              role: "user",
+              parts: [{ type: "text", text: "Try this request" }],
+              ...(isHeldCall
+                ? { metadata: { held_call: { review_id: "r1" } } }
+                : {}),
+            },
+          ]}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry message" }));
+
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith({
+          title: "Couldn't retry message",
+          description:
+            "Could not reach the server — your previous message is still in the chat.",
+          variant: "destructive",
+        }),
+      );
+      expect(toast).toHaveBeenCalledTimes(1);
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend.mock.calls[0][0]).toBe(
+        isHeldCall ? "Continue from where you left off." : "Try this request",
+      );
+    },
+  );
+
+  it("shows an error when retrying throws before dispatch", async () => {
+    const onSend = vi.fn(() => {
+      throw new Error("Could not start the request");
+    });
+    render(
+      <ChatContainer
+        {...baseProps}
+        onSend={onSend}
+        messages={[
+          {
+            id: "failed-request",
+            role: "user",
+            parts: [{ type: "text", text: "Try this request" }],
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry message" }));
+
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith({
+        title: "Couldn't retry message",
+        description:
+          "Could not start the request — your previous message is still in the chat.",
+        variant: "destructive",
+      }),
+    );
+    expect(toast).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores repeated retry clicks until the attempt settles and allows retrying again after failure", async () => {
+    let rejectSend: (error: Error) => void = () => {};
+    const pendingSend = new Promise<void>((_resolve, reject) => {
+      rejectSend = reject;
+    });
+    const onSend = vi
+      .fn()
+      .mockReturnValueOnce(pendingSend)
+      .mockResolvedValue(undefined);
+    render(
+      <ChatContainer
+        {...baseProps}
+        error={new Error("The model returned an empty response.")}
+        onSend={onSend}
+        messages={[
+          {
+            id: "failed-request",
+            role: "user",
+            parts: [{ type: "text", text: "Try this request" }],
+          },
+        ]}
+      />,
+    );
+    const retryButton = screen.getByRole("button", { name: "Retry message" });
+
+    fireEvent.click(retryButton);
+    fireEvent.click(retryButton);
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+
+    await act(async () => rejectSend(new Error("Could not reach the server")));
+    await waitFor(() => expect(toast).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(retryButton);
+
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(onSend.mock.calls[1][0]).toBe("Try this request");
+  });
+
   it("does not render the shared-chat notice for unshared chats", async () => {
     render(<ChatContainer {...baseProps} />);
 
@@ -344,8 +526,6 @@ describe("ChatContainer", () => {
     }
 
     it("does not auto-open the artifact panel on initial render", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
-
       render(<ChatContainer {...baseProps} />);
 
       expect(useCopilotUIStore.getState().artifactPanel.isOpen).toBe(false);
@@ -353,8 +533,6 @@ describe("ChatContainer", () => {
     });
 
     it("does not auto-open when rerendering within the same session", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
-
       const { rerender } = render(<ChatContainer {...baseProps} />);
       rerender(<ChatContainer {...baseProps} />);
 
@@ -363,7 +541,6 @@ describe("ChatContainer", () => {
     });
 
     it("clears the artifact preview when sessionId changes", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
       useCopilotUIStore
         .getState()
         .openArtifact(makeArtifact(ARTIFACT_A_ID, "a.txt"));
@@ -391,7 +568,6 @@ describe("ChatContainer", () => {
     });
 
     it("does not carry a stale back stack into the next session", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
       useCopilotUIStore
         .getState()
         .openArtifact(makeArtifact(ARTIFACT_A_ID, "a.txt"));
@@ -412,7 +588,6 @@ describe("ChatContainer", () => {
     });
 
     it("clears artifact preview on unmount so nav-away cannot resurrect it (SECRT-2254)", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
       useCopilotUIStore
         .getState()
         .openArtifact(makeArtifact(ARTIFACT_A_ID, "a.txt"));
@@ -432,7 +607,6 @@ describe("ChatContainer", () => {
     });
 
     it("does not re-open a panel whose store state is stale on fresh mount (SECRT-2220)", () => {
-      mockArtifactsEnabled.mockReturnValue(true);
       useCopilotUIStore.setState({
         artifactPanel: {
           isOpen: true,

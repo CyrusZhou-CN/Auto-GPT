@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from backend.copilot.capabilities.registry import configured_tool, get_registry
 from backend.copilot.capabilities.resolve import resolve_entry
+from backend.copilot.capabilities.sources import SKILL_TOOL, expert_dispatch, skill_name
 
 if TYPE_CHECKING:
     from backend.copilot.tools.base import BaseTool
@@ -32,7 +33,14 @@ def resolve_tool_dispatch(
     tool_name: str, args: Mapping[str, Any] | None
 ) -> DispatchedToolCall | None:
     """The platform tool a ``run_capability`` call runs, or None when the call
-    is not one — another tool, a block or MCP id, or ``validate_only``.
+    is not one — another tool, a block or MCP id, ``validate_only``, or a
+    ``connect`` call.
+
+    A ``skill:<name>`` id is the ``read_skill`` call that loads the skill,
+    with the name taken from the id, so a skill found by search is loaded
+    through the one tool path like any other skill.  An ``expert:`` id is the
+    ``hire_expert`` call for that template and a ``teammate:`` id the
+    ``delegate_to_expert`` call for that expert, the id bound over the input.
 
     Never raises: it runs on the streaming path, where a bad id must degrade to
     the dispatcher's own "unknown capability" answer rather than break the turn.
@@ -42,10 +50,18 @@ def resolve_tool_dispatch(
     if args.get("validate_only"):
         return None
     try:
-        entry = resolve_entry(get_registry(), str(args.get("id") or ""))
-        if entry is None or entry.kind != "tool" or not entry.implementations:
-            return None
-        name = entry.implementations[0].ref
+        capability_id = str(args.get("id") or "")
+        skill = skill_name(capability_id)
+        expert = expert_dispatch(capability_id)
+        if skill is not None:
+            name, bound = SKILL_TOOL, {"name": skill}
+        elif expert is not None:
+            name, bound = expert
+        else:
+            entry = resolve_entry(get_registry(), capability_id)
+            if entry is None or entry.kind != "tool" or not entry.implementations:
+                return None
+            name, bound = entry.implementations[0].ref, {}
         tool = configured_tool(name)
     except Exception:
         logger.warning("Could not resolve capability dispatch", exc_info=True)
@@ -57,4 +73,7 @@ def resolve_tool_dispatch(
         # Coercing it to {} would run the tool on its defaults; the dispatcher
         # owns the "input must be an object" answer, so leave the call to it.
         return None
-    return DispatchedToolCall(tool, name, dict(payload or {}))
+    if payload and payload.get("connect"):
+        # A tool has nothing to connect; the dispatcher describes it instead.
+        return None
+    return DispatchedToolCall(tool, name, {**dict(payload or {}), **bound})

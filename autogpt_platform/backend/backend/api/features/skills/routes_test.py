@@ -184,6 +184,13 @@ def test_read_copilot_skill_returns_user_body(
             )
         ),
     )
+    # Unstubbed, listing the files upserts the user's workspace through the
+    # session's database client from TestClient's own event loop, and that
+    # write left its connection inside an open transaction for later tests.
+    mocker.patch(
+        "backend.api.features.skills.routes.list_user_skill_files",
+        AsyncMock(return_value=[]),
+    )
 
     response = client.get("/skills/oauth_flow")
     assert response.status_code == 200
@@ -282,10 +289,10 @@ def test_upload_copilot_skill_rejects_malformed_markdown() -> None:
 def test_upload_copilot_skill_returns_409_when_at_cap(
     mocker: pytest_mock.MockFixture,
 ) -> None:
-    """The per-user cap surfaces as 409 so the UI can prompt a delete."""
+    """The per-expert cap surfaces as 409 so the UI can prompt a delete."""
     mocker.patch(
         "backend.api.features.skills.routes.store_user_skill",
-        AsyncMock(side_effect=SkillLimitError("Skill limit reached (50).")),
+        AsyncMock(side_effect=SkillLimitError("Skill limit reached (150).")),
     )
 
     response = client.post("/skills", json={"content": _VALID_SKILL_MD})
