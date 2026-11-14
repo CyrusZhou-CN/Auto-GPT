@@ -39,6 +39,12 @@ export interface ExpertKickoffSend {
 export type KickoffStatus = "idle" | "pending" | "done";
 export type KickoffAttemptToken = string;
 
+/** Opens the expert's chat, adopting their latest thread, or starts their
+ *  first one with the introduction when they have none yet. */
+export function expertKickoffHref(expertId: string) {
+  return `/copilot?expertId=${encodeURIComponent(expertId)}&kickoff=1`;
+}
+
 export function buildKickoffMessage(
   expertId: string,
   attemptToken?: KickoffAttemptToken,
@@ -120,18 +126,20 @@ export function isKickoffMessage(message: UIMessage): boolean {
 }
 
 export function shouldClearKickoffParam(
-  isExpertsEnabled: boolean,
   hasExpertsSettled: boolean,
   expertId: string | null,
 ): boolean {
-  return !isExpertsEnabled || (hasExpertsSettled && expertId === null);
+  return hasExpertsSettled && expertId === null;
 }
 
 // The kickoff prompt is a control turn the client sends on the user's behalf.
 // It reads as an instruction, not as something the user typed, so the thread
 // never shows it. The backend marks the persisted row hidden for the same
 // reason.
+// Returns `messages` itself when there is nothing to hide, so memoised
+// consumers keyed on the array see no change.
 export function hideKickoffMessages<T extends UIMessage>(messages: T[]): T[] {
+  if (!messages.some(isKickoffMessage)) return messages;
   return messages.filter((message) => !isKickoffMessage(message));
 }
 
